@@ -2212,10 +2212,25 @@ impl MappedSharedWalCoordination {
     /// lock can be acquired, or PID is no longer alive), the slot is reclaimed
     /// inline and excluded from the result.
     pub(crate) fn min_active_reader_frame(&self) -> Option<u64> {
+        self.min_active_reader_frame_excluding(None)
+    }
+
+    /// Return the smallest live reader frame while ignoring exactly one slot.
+    ///
+    /// The writer-restart path uses this only after exclusively upgrading its
+    /// process-local read mark 0. That upgrade proves no sibling connection is
+    /// sharing the writer's reader slot, so excluding it cannot hide a peer.
+    pub(crate) fn min_active_reader_frame_excluding(
+        &self,
+        excluded_slot: Option<u32>,
+    ) -> Option<u64> {
         self.reader_frames()
             .iter()
             .enumerate()
             .filter_map(|(slot_index, frame)| {
+                if excluded_slot == Some(slot_index as u32) {
+                    return None;
+                }
                 if !self.uses_linux_ofd_locking() {
                     let owner = self.reader_owner(slot_index as u32)?;
                     let frame = frame.load(Ordering::Acquire);
@@ -3354,6 +3369,28 @@ mod tests {
 
         assert_eq!(mapped_a.bump_checkpoint_epoch(), 0);
         assert_eq!(mapped_b.checkpoint_epoch(), 1);
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_excludes_only_the_named_reader_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+        let reader_a = mapped.register_reader(mapped.owner_record(), 5).unwrap();
+        let reader_b = mapped.register_reader(mapped.owner_record(), 9).unwrap();
+
+        assert_eq!(mapped.min_active_reader_frame(), Some(5));
+        assert_eq!(
+            mapped.min_active_reader_frame_excluding(Some(reader_a.slot_index)),
+            Some(9)
+        );
+        assert_eq!(
+            mapped.min_active_reader_frame_excluding(Some(reader_b.slot_index)),
+            Some(5)
+        );
+
+        mapped.unregister_reader(reader_a);
+        mapped.unregister_reader(reader_b);
     }
 
     #[test]

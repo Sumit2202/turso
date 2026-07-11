@@ -553,6 +553,17 @@ trait WalCoordination: Debug + Send + Sync {
     /// Begin a restart while the caller holds the required external checkpoint/write guards.
     fn begin_restart(&self, io: &dyn IO) -> Result<WalSnapshot>;
 
+    /// Begin a restart while excluding one backend reader slot that the caller
+    /// has proved it owns exclusively.
+    fn begin_restart_excluding(
+        &self,
+        io: &dyn IO,
+        excluded_reader_slot: Option<u32>,
+    ) -> Result<WalSnapshot> {
+        debug_assert!(excluded_reader_slot.is_none());
+        self.begin_restart(io)
+    }
+
     /// Release any restart-only coordination state held by `begin_restart`.
     fn end_restart(&self);
 
@@ -2196,6 +2207,14 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn begin_restart(&self, io: &dyn IO) -> Result<WalSnapshot> {
+        self.begin_restart_excluding(io, None)
+    }
+
+    fn begin_restart_excluding(
+        &self,
+        io: &dyn IO,
+        excluded_reader_slot: Option<u32>,
+    ) -> Result<WalSnapshot> {
         for idx in 1..5 {
             if !self.fallback.try_read_mark_exclusive(idx) {
                 for held_idx in 1..idx {
@@ -2209,7 +2228,11 @@ impl WalCoordination for ShmWalCoordination {
         // active cross-process readers before proceeding with the WAL restart,
         // otherwise we reset the shared WAL state while another process still has
         // an active read transaction, leading to data loss.
-        if self.authority.min_active_reader_frame().is_some() {
+        if self
+            .authority
+            .min_active_reader_frame_excluding(excluded_reader_slot)
+            .is_some()
+        {
             for idx in 1..5 {
                 self.fallback.unlock_read_mark(idx);
             }
@@ -2226,7 +2249,12 @@ impl WalCoordination for ShmWalCoordination {
         if !self.fallback.try_upgrade_read_mark(0) {
             return Ok(None);
         }
-        let result = self.begin_restart(io);
+        let own_reader_slot = self
+            .active_reader
+            .lock()
+            .as_ref()
+            .map(|reader| reader.slot_index);
+        let result = self.begin_restart_excluding(io, own_reader_slot);
         self.fallback.downgrade_read_mark(0);
         match result {
             Ok(snapshot) => {
@@ -6997,6 +7025,98 @@ pub mod test {
             vec![(7, 2), (9, 4)]
         );
         assert!(shm_path.exists());
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn test_shm_writer_restart_ignores_only_its_own_db_file_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-writer-restart-own-reader.db-wal");
+        let shm_path = dir.path().join("test-writer-restart-own-reader.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let snapshot = WalSnapshot {
+            max_frame: 14,
+            nbackfills: 14,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 9,
+        };
+        set_shared_snapshot(&shared, snapshot);
+        {
+            let shared = shared.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = snapshot.last_checksum.0;
+            header.checksum_2 = snapshot.last_checksum.1;
+        }
+
+        let (_authority, writer) = make_test_shm_coordination(&shared, &shm_path);
+        let writer_guard = writer.try_begin_read_tx(snapshot).unwrap();
+        assert!(writer.try_begin_write_tx());
+        let restarted = writer
+            .try_restart_log_for_write(io.as_ref())
+            .unwrap()
+            .expect("writer should exclude its own upgraded reader slot");
+        assert_eq!(restarted.max_frame, 0);
+        assert!(restarted.checkpoint_seq > snapshot.checkpoint_seq);
+        writer.end_write_tx();
+        writer.end_read_tx(writer_guard);
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn test_shm_writer_restart_keeps_sibling_reader_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-writer-restart-sibling-reader.db-wal");
+        let shm_path = dir
+            .path()
+            .join("test-writer-restart-sibling-reader.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let snapshot = WalSnapshot {
+            max_frame: 14,
+            nbackfills: 14,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 9,
+        };
+        set_shared_snapshot(&shared, snapshot);
+        {
+            let shared = shared.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = snapshot.last_checksum.0;
+            header.checksum_2 = snapshot.last_checksum.1;
+        }
+
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let writer = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let sibling = ShmWalCoordination::new(shared, authority);
+        let writer_guard = writer.try_begin_read_tx(snapshot).unwrap();
+        let sibling_guard = sibling.try_begin_read_tx(snapshot).unwrap();
+        assert!(writer.try_begin_write_tx());
+        assert!(
+            writer
+                .try_restart_log_for_write(io.as_ref())
+                .unwrap()
+                .is_none(),
+            "sibling reader must prevent the writer's process-local read-mark upgrade"
+        );
+        writer.end_write_tx();
+        sibling.end_read_tx(sibling_guard);
+        writer.end_read_tx(writer_guard);
     }
 
     #[cfg(host_shared_wal)]
