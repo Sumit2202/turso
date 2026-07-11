@@ -70,6 +70,7 @@ mod pseudo;
 mod regexp;
 #[cfg(feature = "series")]
 mod series;
+mod snapshot;
 mod stack;
 mod statement;
 mod stats;
@@ -1847,6 +1848,9 @@ impl Database {
                     // Determine if we should open in MVCC mode based on the database header version
                     // MVCC is controlled only by the database header (set via PRAGMA journal_mode)
                     let open_mv_store = matches!(read_version, Version::Mvcc);
+                    if open_mv_store {
+                        self.ensure_mvcc_compatible_with_multiprocess_wal()?;
+                    }
 
                     // Now check the Header Version to see which mode the DB file really is on
                     // Track if header was modified so we can write it to disk
@@ -2937,6 +2941,23 @@ impl Database {
 
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
         self.opts.enable_multiprocess_wal
+    }
+
+    /// Reject MVCC when the active platform can honor multiprocess WAL.
+    ///
+    /// The `.tshm` authority coordinates pager WAL state only. MVCC's in-memory
+    /// store, commit/checkpoint locks, and logical-log writer state are
+    /// process-local, so combining the modes cannot preserve MVCC correctness.
+    pub(crate) fn ensure_mvcc_compatible_with_multiprocess_wal(&self) -> Result<()> {
+        #[cfg(host_shared_wal)]
+        if self.opts.enable_multiprocess_wal {
+            return Err(LimboError::InvalidArgument(
+                "MVCC journal mode is not supported with experimental multiprocess WAL; use WAL journal mode or disable experimental multiprocess WAL"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     pub fn experimental_without_rowid_enabled(&self) -> bool {

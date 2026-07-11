@@ -16112,6 +16112,13 @@ fn op_journal_mode_inner(
                     }
                 };
 
+                if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
+                    program
+                        .connection
+                        .db
+                        .ensure_mvcc_compatible_with_multiprocess_wal()?;
+                }
+
                 // If same mode, just return
                 if prev_mode == new_mode {
                     let ret: &'static str = new_mode.into();

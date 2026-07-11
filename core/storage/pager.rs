@@ -1027,6 +1027,8 @@ struct CheckpointState {
     mode: Option<CheckpointMode>,
     /// The checkpoint state machine should acquire the lock or use the one by caller
     lock_source: CheckpointLockSource,
+    /// Return a successful checkpoint with checkpoint/writer authority still held.
+    retain_guard: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -4481,6 +4483,7 @@ impl Pager {
         state.result = None;
         state.mode = None;
         state.lock_source = CheckpointLockSource::Acquire;
+        state.retain_guard = false;
     }
 
     /// Clean up after a auto-checkpoint failure.
@@ -4540,6 +4543,21 @@ impl Pager {
             sync_mode,
             clear_page_cache,
             CheckpointLockSource::Acquire,
+            false,
+        )
+    }
+
+    /// Run a durable TRUNCATE checkpoint and return with checkpoint and writer
+    /// authority still held. Dropping the returned result releases the guard.
+    pub(crate) fn snapshot_checkpoint(&self) -> Result<IOResult<CheckpointResult>> {
+        self.checkpoint_inner(
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+            crate::SyncMode::Full,
+            true,
+            CheckpointLockSource::Acquire,
+            true,
         )
     }
 
@@ -4555,6 +4573,7 @@ impl Pager {
             sync_mode,
             clear_page_cache,
             CheckpointLockSource::HeldByCaller,
+            false,
         )
     }
 
@@ -4565,6 +4584,7 @@ impl Pager {
         sync_mode: crate::SyncMode,
         clear_page_cache: bool,
         lock_source: CheckpointLockSource,
+        retain_guard: bool,
     ) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("checkpoint() called on database without WAL");
@@ -4587,6 +4607,7 @@ impl Pager {
                     };
                     state.mode = Some(mode);
                     state.lock_source = lock_source;
+                    state.retain_guard = retain_guard;
                 }
                 CheckpointPhase::Checkpoint {
                     mode,
@@ -4873,9 +4894,11 @@ impl Pager {
                 CheckpointPhase::Finalize { clear_page_cache } => {
                     let mut state = self.checkpoint_state.write();
                     let mut res = state.result.take().expect("result should be set");
+                    let retain_guard = state.retain_guard;
                     state.phase = CheckpointPhase::NotCheckpointing;
                     state.mode = None;
                     state.lock_source = CheckpointLockSource::Acquire;
+                    state.retain_guard = false;
 
                     // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not)
                     if clear_page_cache {
@@ -4886,8 +4909,14 @@ impl Pager {
                         })?;
                     }
 
-                    // Release checkpoint guard
-                    res.release_guard();
+                    if retain_guard {
+                        turso_assert!(
+                            res.guard_held(),
+                            "snapshot checkpoint must return with checkpoint/writer authority held"
+                        );
+                    } else {
+                        res.release_guard();
+                    }
 
                     return Ok(IOResult::Done(res));
                 }
@@ -5005,6 +5034,14 @@ impl Pager {
         sync_mode: crate::SyncMode,
     ) -> Result<CheckpointResult> {
         self.io.block(|| self.checkpoint(mode, sync_mode, true))
+    }
+
+    pub(crate) fn blocking_snapshot_checkpoint(&self) -> Result<CheckpointResult> {
+        let result = self.io.block(|| self.snapshot_checkpoint());
+        if result.is_err() {
+            self.cleanup_after_checkpoint_failure();
+        }
+        result
     }
 
     pub fn freepage_list(&self) -> u32 {

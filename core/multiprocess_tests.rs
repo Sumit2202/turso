@@ -311,6 +311,297 @@ fn database_open_with_experimental_multiprocess_wal_rejects_unsupported_io_backe
 }
 
 #[test]
+fn pragma_journal_mode_mvcc_rejects_multiprocess_wal_before_creating_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("multiprocess-reject-mvcc-pragma.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+
+    let err = conn
+        .execute("PRAGMA journal_mode = 'mvcc'")
+        .expect_err("multiprocess WAL must reject enabling MVCC");
+    assert!(
+        matches!(err, LimboError::InvalidArgument(ref message) if message.contains("MVCC journal mode is not supported with experimental multiprocess WAL")),
+        "expected explicit MVCC/multiprocess WAL rejection, got {err:?}"
+    );
+    assert!(!db.mvcc_enabled(), "rejection must leave MVCC disabled");
+    assert!(
+        !db_path.with_extension("db-log").exists(),
+        "rejection must happen before creating the MVCC logical log"
+    );
+}
+
+#[test]
+fn database_open_with_experimental_multiprocess_wal_rejects_existing_mvcc_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("multiprocess-reject-existing-mvcc.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    {
+        let db = Database::open_file(io.clone(), db_path_str).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+    }
+    DATABASE_MANAGER.lock().clear();
+
+    let err = open_multiprocess_db(io, db_path_str)
+        .expect_err("multiprocess WAL must reject an existing MVCC database");
+    assert!(
+        matches!(err, LimboError::InvalidArgument(ref message) if message.contains("MVCC journal mode is not supported with experimental multiprocess WAL")),
+        "expected explicit MVCC/multiprocess WAL rejection, got {err:?}"
+    );
+
+    let tshm_path = storage::wal::coordination_path_for_wal_path(&format!("{db_path_str}-wal"));
+    assert!(
+        !std::path::Path::new(&tshm_path).exists(),
+        "existing-MVCC rejection must happen before creating the multiprocess WAL authority"
+    );
+}
+
+#[test]
+fn snapshot_to_file_releases_writer_authority_after_clone_establishment() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("snapshot-retains-authority.db");
+    let snapshot_path = dir.path().join("snapshot-retains-authority-copy.db");
+    let db = open_multiprocess_db(multiprocess_test_io(), db_path.to_str().unwrap()).unwrap();
+    let snapshot_conn = db.connect().unwrap();
+    let writer_conn = db.connect().unwrap();
+    let checkpointer_conn = db.connect().unwrap();
+    snapshot_conn.wal_auto_actions_disable();
+    writer_conn.wal_auto_actions_disable();
+    checkpointer_conn.wal_auto_actions_disable();
+    snapshot_conn
+        .execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    snapshot_conn
+        .execute("insert into test(value) values ('before-snapshot')")
+        .unwrap();
+
+    let after_checkpoint = || {
+        let (writer_err, checkpoint_err) = std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                writer_conn
+                    .execute("insert into test(value) values ('unsafe-gap-write')")
+                    .expect_err("snapshot checkpoint must retain shared writer authority")
+            });
+            let checkpointer = scope.spawn(|| {
+                checkpointer_conn
+                    .checkpoint(CheckpointMode::Truncate {
+                        upper_bound_inclusive: None,
+                    })
+                    .expect_err("snapshot checkpoint must retain shared checkpoint authority")
+            });
+            (writer.join().unwrap(), checkpointer.join().unwrap())
+        });
+        assert!(
+            matches!(writer_err, LimboError::Busy),
+            "writer should see structured Busy while snapshot owns authority: {writer_err:?}"
+        );
+        assert!(
+            matches!(checkpoint_err, LimboError::Busy),
+            "checkpointer should see structured Busy while snapshot owns authority: {checkpoint_err:?}"
+        );
+    };
+    let before_publish = || {
+        writer_conn
+            .execute("insert into test(value) values ('after-clone')")
+            .expect("writer authority must be released after clone establishment");
+    };
+
+    snapshot_conn
+        .snapshot_to_file_for_testing(
+            &snapshot_path,
+            true,
+            Some(&after_checkpoint),
+            Some(&before_publish),
+        )
+        .unwrap();
+
+    let source_rows = get_rows(&snapshot_conn, "select value from test order by id");
+    assert_eq!(source_rows.len(), 2);
+    assert_eq!(source_rows[1][0].to_string(), "after-clone");
+
+    let snapshot_db =
+        Database::open_file(multiprocess_test_io(), snapshot_path.to_str().unwrap()).unwrap();
+    let snapshot_reader = snapshot_db.connect().unwrap();
+    let rows = get_rows(&snapshot_reader, "select value from test order by id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "before-snapshot");
+}
+
+#[test]
+fn snapshot_to_file_checkpoint_busy_is_structured_and_publishes_no_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("snapshot-checkpoint-busy.db");
+    let snapshot_path = dir.path().join("snapshot-checkpoint-busy-copy.db");
+    let db = open_multiprocess_db(multiprocess_test_io(), db_path.to_str().unwrap()).unwrap();
+    let snapshot_conn = db.connect().unwrap();
+    let reader_conn = db.connect().unwrap();
+    snapshot_conn.wal_auto_actions_disable();
+    reader_conn.wal_auto_actions_disable();
+    snapshot_conn
+        .execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    snapshot_conn
+        .execute("insert into test(value) values ('reader-snapshot')")
+        .unwrap();
+
+    reader_conn.execute("begin").unwrap();
+    assert_eq!(count_test_rows(&reader_conn), 1);
+    let error = snapshot_conn
+        .snapshot_to_file(&snapshot_path)
+        .expect_err("active reader must make the snapshot TRUNCATE checkpoint busy");
+    assert!(
+        matches!(error, LimboError::Busy),
+        "snapshot checkpoint contention must surface as structured Busy: {error:?}"
+    );
+    assert!(
+        !snapshot_path.exists(),
+        "a Busy snapshot must not publish a partial destination"
+    );
+    reader_conn.execute("rollback").unwrap();
+}
+
+#[test]
+fn snapshot_to_file_uses_logical_fallback_without_copying_live_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("snapshot-logical-fallback.db");
+    let snapshot_path = dir.path().join("logical-'snapshot'.db");
+    let db = open_multiprocess_db(multiprocess_test_io(), db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.wal_auto_actions_disable();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('one'), ('two'), ('three')")
+        .unwrap();
+
+    conn.snapshot_to_file_for_testing(&snapshot_path, false, None, None)
+        .unwrap();
+
+    let snapshot_db =
+        Database::open_file(multiprocess_test_io(), snapshot_path.to_str().unwrap()).unwrap();
+    let snapshot_reader = snapshot_db.connect().unwrap();
+    let rows = get_rows(&snapshot_reader, "select value from test order by id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0].to_string(), "one");
+    assert_eq!(rows[1][0].to_string(), "two");
+    assert_eq!(rows[2][0].to_string(), "three");
+}
+
+#[test]
+fn snapshot_to_file_publish_collision_does_not_overwrite_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("snapshot-publish-collision.db");
+    let snapshot_path = dir.path().join("snapshot-publish-collision-copy.db");
+    let db = open_multiprocess_db(multiprocess_test_io(), db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.wal_auto_actions_disable();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('complete-staged-image')")
+        .unwrap();
+
+    let create_competing_target = || {
+        std::fs::write(&snapshot_path, b"competing target").unwrap();
+    };
+    let error = conn
+        .snapshot_to_file_for_testing(&snapshot_path, false, None, Some(&create_competing_target))
+        .expect_err("no-replace publication must reject a racing target");
+    assert!(
+        matches!(
+            error,
+            LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::AlreadyExists,
+                "publish snapshot without replacement"
+            ))
+        ),
+        "publish collision should retain an AlreadyExists I/O error: {error:?}"
+    );
+    assert_eq!(
+        std::fs::read(&snapshot_path).unwrap(),
+        b"competing target",
+        "snapshot publication must never overwrite a racing destination"
+    );
+    assert!(
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".turso-snapshot-")),
+        "failed publication must clean its private staged snapshot"
+    );
+}
+
+#[test]
+fn fully_checkpointed_reader_registers_shared_slot_across_peer_write_and_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("fully-checkpointed-shared-reader.db");
+    let db = open_multiprocess_db(multiprocess_test_io(), db_path.to_str().unwrap()).unwrap();
+    let setup_conn = db.connect().unwrap();
+    let reader_conn = db.connect().unwrap();
+    let writer_conn = db.connect().unwrap();
+    setup_conn.wal_auto_actions_disable();
+    reader_conn.wal_auto_actions_disable();
+    writer_conn.wal_auto_actions_disable();
+    setup_conn
+        .execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    setup_conn
+        .execute("insert into test(value) values ('before-reader')")
+        .unwrap();
+    run_checkpoint(
+        &setup_conn,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    let fully_checkpointed = authority.snapshot();
+    assert_eq!(fully_checkpointed.max_frame, fully_checkpointed.nbackfills);
+
+    reader_conn.execute("begin").unwrap();
+    assert_eq!(count_test_rows(&reader_conn), 1);
+    assert_eq!(
+        authority.min_active_reader_frame(),
+        Some(fully_checkpointed.max_frame),
+        "DbFile readers must publish their snapshot to shared coordination"
+    );
+
+    writer_conn
+        .execute("insert into test(value) values ('after-reader')")
+        .unwrap();
+    assert_eq!(
+        count_test_rows(&reader_conn),
+        1,
+        "fully-checkpointed reader must retain its pre-write snapshot"
+    );
+    let checkpoint_error = writer_conn
+        .checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .expect_err("peer checkpoint must not overwrite a DbFile reader snapshot");
+    assert!(
+        matches!(checkpoint_error, LimboError::Busy),
+        "peer checkpoint should return Busy while DbFile reader is active: {checkpoint_error:?}"
+    );
+
+    reader_conn.execute("commit").unwrap();
+    assert_eq!(authority.min_active_reader_frame(), None);
+    writer_conn
+        .checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+}
+
+#[test]
 fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_file() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("readonly-multiprocess-no-tshm.db");

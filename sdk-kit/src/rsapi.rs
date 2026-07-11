@@ -1205,6 +1205,20 @@ impl TursoConnection {
         Ok(())
     }
 
+    /// Create a durable, no-overwrite snapshot of an ordinary-WAL database
+    /// using the engine's multiprocess WAL authority.
+    pub fn snapshot_to_file(&self, destination: &str) -> Result<(), TursoError> {
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
+        let guard = self.concurrent_guard.clone();
+        let _guard = guard.try_use()?;
+        self.connection
+            .snapshot_to_file(destination)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))
+    }
+
     /// helper method to get C raw container to the TursoConnection instance
     /// this method is used in the capi wrappers
     pub fn to_capi(self: Arc<Self>) -> *mut capi::c::turso_connection_t {

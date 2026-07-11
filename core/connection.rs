@@ -2200,9 +2200,12 @@ impl Connection {
                 }
             }
         } else {
-            self.pager
-                .load()
-                .blocking_checkpoint(mode, self.get_sync_mode())
+            let pager = self.pager.load();
+            let result = pager.blocking_checkpoint(mode, self.get_sync_mode());
+            if result.is_err() {
+                pager.cleanup_after_checkpoint_failure();
+            }
+            result
         }
     }
 

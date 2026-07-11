@@ -111,6 +111,10 @@ impl CheckpointResult {
     pub fn release_guard(&mut self) {
         let _ = self.maybe_guard.take();
     }
+
+    pub(crate) fn guard_held(&self) -> bool {
+        self.maybe_guard.is_some()
+    }
 }
 
 #[cfg(host_shared_wal)]
@@ -1970,6 +1974,22 @@ impl WalCoordination for ShmWalCoordination {
                 read_locks[0].unlock();
                 return None;
             }
+            let Some(reader) = self
+                .authority
+                .register_reader_for_snapshot(self.owner, snapshot.max_frame)
+            else {
+                read_locks[0].unlock();
+                return None;
+            };
+            if self.load_snapshot() != snapshot {
+                self.authority.unregister_reader_for_snapshot(reader);
+                read_locks[0].unlock();
+                return None;
+            }
+
+            let mut active_reader = self.active_reader.lock();
+            turso_assert!(active_reader.is_none(), "shared reader registration leaked");
+            *active_reader = Some(reader);
             return Some(ReadGuardKind::DbFile);
         }
 
@@ -2008,9 +2028,13 @@ impl WalCoordination for ShmWalCoordination {
 
         let read_mark_index =
             NonZeroUsize::new(best_idx as usize).expect("best_idx checked to be positive");
-        let reader = self
+        let Some(reader) = self
             .authority
-            .register_reader_for_snapshot(self.owner, snapshot.max_frame)?;
+            .register_reader_for_snapshot(self.owner, snapshot.max_frame)
+        else {
+            read_locks[best_idx as usize].unlock();
+            return None;
+        };
         if self.load_snapshot() != snapshot {
             self.authority.unregister_reader_for_snapshot(reader);
             read_locks[best_idx as usize].unlock();

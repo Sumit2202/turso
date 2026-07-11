@@ -64,6 +64,7 @@ Multi-process WAL is only available when all of the following hold:
   Opening a database on any of these filesystems with `multiprocess_wal` enabled returns `InvalidArgument`.
 
 - **Not in-memory**: `:memory:` and `file::memory:` paths are rejected — shared coordination requires a durable file.
+- **WAL journal mode only**: MVCC keeps its transaction state and `.db-log` writer/checkpoint coordination inside one process. Opening an existing MVCC database or running `PRAGMA journal_mode=mvcc` with `multiprocess_wal` enabled returns `InvalidArgument`.
 
 ## Enabling Multi-Process Access
 
@@ -151,7 +152,7 @@ Read-only opens are advisory: if `multiprocess_wal` is requested on a read-only 
 
 - The `.tshm` file format is versioned and may change in future releases. A format bump invalidates existing `.tshm` files — Turso recreates them on open; it does not attempt cross-version migration.
 - Attached databases (via [ATTACH DATABASE](/docs/sql-reference/statements/attach-database)) inherit the multi-process setting of the main connection.
-- The feature is not yet supported under MVCC (`BEGIN CONCURRENT`). Use either MVCC within a single process or multi-process WAL with the default isolation model, not both.
+- The feature is not supported under MVCC (`BEGIN CONCURRENT`). The engine rejects this combination before opening or creating the MVCC logical log. Use either MVCC within a single process or multi-process WAL with the default isolation model, not both.
 - The concurrent-simulator and stress tests for multi-process mode run only on 64-bit Unix targets. Windows, WASM, and 32-bit builds silently ignore the flag.
 
 ## See Also

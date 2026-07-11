@@ -7,6 +7,7 @@ use crate::Row;
 use crate::Rows;
 use crate::Statement;
 use std::fmt::Debug;
+use std::path::Path;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -215,6 +216,22 @@ impl Connection {
     pub fn cacheflush(&self) -> Result<()> {
         let conn = self.get_inner_connection()?;
         conn.cacheflush()?;
+        Ok(())
+    }
+
+    /// Create a durable snapshot at `destination` without overwriting an
+    /// existing path.
+    ///
+    /// The database must use ordinary WAL with experimental multiprocess WAL.
+    /// Checkpoint contention is returned as [`Error::Busy`].
+    pub async fn snapshot_to_file(&self, destination: impl AsRef<Path>) -> Result<()> {
+        let destination = destination.as_ref().to_path_buf();
+        self.maybe_handle_dangling_tx().await?;
+        let destination = destination
+            .to_str()
+            .ok_or_else(|| Error::Misuse("snapshot destination must be valid UTF-8".to_string()))?;
+        let conn = self.get_inner_connection()?;
+        conn.snapshot_to_file(destination)?;
         Ok(())
     }
 
