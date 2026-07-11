@@ -31,11 +31,11 @@ impl Connection {
     /// overwriting an existing path.
     ///
     /// This API is for ordinary-WAL databases opened with experimental
-    /// multiprocess WAL. It performs a durable FULL checkpoint and keeps
-    /// the shared checkpoint and writer authority until a CoW clone is
-    /// established. Filesystems without reflink support use `VACUUM INTO`
-    /// under a shared-reader snapshot instead of copying the live database
-    /// file.
+    /// multiprocess WAL. It prefers a durable FULL checkpoint and keeps the
+    /// shared checkpoint and writer authority until a CoW clone is established.
+    /// If an older reader prevents that checkpoint, or the filesystem has no
+    /// reflink support, it uses `VACUUM INTO` under a shared-reader snapshot
+    /// instead of copying an incomplete live database file.
     pub fn snapshot_to_file(self: &Arc<Self>, destination: impl AsRef<Path>) -> Result<()> {
         self.snapshot_to_file_inner(destination.as_ref(), SnapshotOptions::default())
     }
@@ -74,28 +74,38 @@ impl Connection {
         let staged_path = staging_dir.path().join("snapshot.db");
 
         let pager = self.pager.load();
-        let checkpoint_guard = pager.blocking_snapshot_checkpoint()?;
-        if let Some(after_checkpoint) = options.after_checkpoint {
-            after_checkpoint();
-        }
-
-        let reflink = if options.attempt_reflink {
-            try_create_reflink(Path::new(&self.db.path), &staged_path)?
-        } else {
-            ReflinkOutcome::Unsupported
+        let checkpoint_guard = match pager.blocking_snapshot_checkpoint() {
+            Ok(guard) => Some(guard),
+            Err(LimboError::Busy) => None,
+            Err(error) => return Err(error),
         };
 
-        let staged_file = match reflink {
-            ReflinkOutcome::Created(file) => {
-                // FICLONE has fixed the staged inode's CoW view; later source
-                // writes cannot change it, so peer writers may resume now.
-                drop(checkpoint_guard);
-                file
+        let staged_file = if let Some(checkpoint_guard) = checkpoint_guard {
+            if let Some(after_checkpoint) = options.after_checkpoint {
+                after_checkpoint();
             }
-            ReflinkOutcome::Unsupported => {
-                drop(checkpoint_guard);
-                self.create_logical_snapshot(&staged_path)?
+            let reflink = if options.attempt_reflink {
+                try_create_reflink(Path::new(&self.db.path), &staged_path)?
+            } else {
+                ReflinkOutcome::Unsupported
+            };
+            match reflink {
+                ReflinkOutcome::Created(file) => {
+                    // FICLONE has fixed the staged inode's CoW view; later source
+                    // writes cannot change it, so peer writers may resume now.
+                    drop(checkpoint_guard);
+                    file
+                }
+                ReflinkOutcome::Unsupported => {
+                    drop(checkpoint_guard);
+                    self.create_logical_snapshot(&staged_path)?
+                }
             }
+        } else {
+            // An older WAL reader can prevent a FULL checkpoint indefinitely.
+            // VACUUM INTO reads through this connection's coherent WAL snapshot,
+            // producing a standalone image without requiring that reader to move.
+            self.create_logical_snapshot(&staged_path)?
         };
 
         staged_file
