@@ -498,6 +498,38 @@ fn snapshot_to_file_full_checkpoint_allows_reader_at_latest_snapshot() {
 }
 
 #[test]
+fn snapshot_to_file_complete_image_allows_db_file_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("snapshot-complete-reader.db");
+    let snapshot_path = dir.path().join("snapshot-complete-reader-copy.db");
+    let db = open_multiprocess_db(multiprocess_test_io(), db_path.to_str().unwrap()).unwrap();
+    let snapshot_conn = db.connect().unwrap();
+    let reader_conn = db.connect().unwrap();
+    snapshot_conn.wal_auto_actions_disable();
+    reader_conn.wal_auto_actions_disable();
+    snapshot_conn
+        .execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    snapshot_conn
+        .execute("insert into test(value) values ('complete-image')")
+        .unwrap();
+    run_checkpoint(&snapshot_conn, CheckpointMode::Full);
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    let complete = authority.snapshot();
+    assert_eq!(complete.max_frame, complete.nbackfills);
+    reader_conn.execute("begin").unwrap();
+    assert_eq!(count_test_rows(&reader_conn), 1);
+
+    snapshot_conn.snapshot_to_file(&snapshot_path).unwrap();
+    let snapshot_db =
+        Database::open_file(multiprocess_test_io(), snapshot_path.to_str().unwrap()).unwrap();
+    let snapshot_reader = snapshot_db.connect().unwrap();
+    assert_eq!(count_test_rows(&snapshot_reader), 1);
+    reader_conn.execute("rollback").unwrap();
+}
+
+#[test]
 fn snapshot_to_file_uses_logical_fallback_without_copying_live_db() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("snapshot-logical-fallback.db");

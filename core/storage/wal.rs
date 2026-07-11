@@ -466,6 +466,7 @@ struct WalCommitState {
 enum CoordinationCheckpointGuardKind {
     Read0,
     Writer,
+    SnapshotWriter,
 }
 
 /// Coordination operations that back the WAL's authoritative state.
@@ -533,6 +534,11 @@ trait WalCoordination: Debug + Send + Sync {
         &self,
         mode: CheckpointMode,
     ) -> Result<CoordinationCheckpointGuardKind>;
+
+    /// Acquire checkpoint and writer authority for cloning an already fully
+    /// backfilled database image. No read mark is taken because this path does
+    /// not modify the database file; existing readers can safely continue.
+    fn acquire_complete_snapshot_guard(&self) -> Result<CoordinationCheckpointGuardKind>;
 
     /// Acquire the remaining checkpoint-related locks for VACUUM when the
     /// caller already owns the raw process-local checkpoint lock.
@@ -1084,6 +1090,17 @@ impl WalCoordination for InProcessWalCoordination {
         }
     }
 
+    fn acquire_complete_snapshot_guard(&self) -> Result<CoordinationCheckpointGuardKind> {
+        if !self.try_checkpoint_lock() {
+            return Err(LimboError::Busy);
+        }
+        if !self.try_write_lock() {
+            self.unlock_checkpoint_lock();
+            return Err(LimboError::Busy);
+        }
+        Ok(CoordinationCheckpointGuardKind::SnapshotWriter)
+    }
+
     fn acquire_vacuum_checkpoint_guard_from_held_lock(
         &self,
     ) -> Result<CoordinationCheckpointGuardKind> {
@@ -1110,6 +1127,10 @@ impl WalCoordination for InProcessWalCoordination {
             }
             CoordinationCheckpointGuardKind::Read0 => {
                 self.unlock_read_mark(0);
+                self.unlock_checkpoint_lock();
+            }
+            CoordinationCheckpointGuardKind::SnapshotWriter => {
+                self.unlock_write_lock();
                 self.unlock_checkpoint_lock();
             }
         }
@@ -2136,6 +2157,28 @@ impl WalCoordination for ShmWalCoordination {
         }
     }
 
+    fn acquire_complete_snapshot_guard(&self) -> Result<CoordinationCheckpointGuardKind> {
+        if !self.authority.try_acquire_checkpoint(self.owner) {
+            return Err(LimboError::Busy);
+        }
+        if !self.authority.try_acquire_writer(self.owner) {
+            self.authority.release_checkpoint(self.owner);
+            return Err(LimboError::Busy);
+        }
+        if !self.fallback.try_checkpoint_lock() {
+            self.authority.release_writer(self.owner);
+            self.authority.release_checkpoint(self.owner);
+            return Err(LimboError::Busy);
+        }
+        if !self.fallback.try_write_lock() {
+            self.fallback.unlock_checkpoint_lock();
+            self.authority.release_writer(self.owner);
+            self.authority.release_checkpoint(self.owner);
+            return Err(LimboError::Busy);
+        }
+        Ok(CoordinationCheckpointGuardKind::SnapshotWriter)
+    }
+
     fn acquire_vacuum_checkpoint_guard_from_held_lock(
         &self,
     ) -> Result<CoordinationCheckpointGuardKind> {
@@ -2176,6 +2219,12 @@ impl WalCoordination for ShmWalCoordination {
             CoordinationCheckpointGuardKind::Read0 => {
                 self.fallback.unlock_read_mark(0);
                 self.fallback.unlock_checkpoint_lock();
+                self.authority.release_checkpoint(self.owner);
+            }
+            CoordinationCheckpointGuardKind::SnapshotWriter => {
+                self.fallback.unlock_write_lock();
+                self.fallback.unlock_checkpoint_lock();
+                self.authority.release_writer(self.owner);
                 self.authority.release_checkpoint(self.owner);
             }
         }
@@ -2970,6 +3019,9 @@ enum CheckpointLocks {
     Read0 {
         coordination: Arc<dyn WalCoordination>,
     },
+    SnapshotWriter {
+        coordination: Arc<dyn WalCoordination>,
+    },
 }
 
 /// CheckpointLockSource says whether the checkpoint state machine should acquire checkpoint_lock
@@ -2995,6 +3047,9 @@ impl CheckpointLocks {
         Ok(match guard {
             CoordinationCheckpointGuardKind::Read0 => Self::Read0 { coordination },
             CoordinationCheckpointGuardKind::Writer => Self::Writer { coordination },
+            CoordinationCheckpointGuardKind::SnapshotWriter => {
+                Self::SnapshotWriter { coordination }
+            }
         })
     }
 
@@ -3008,6 +3063,9 @@ impl CheckpointLocks {
         Ok(match guard {
             CoordinationCheckpointGuardKind::Read0 => Self::Read0 { coordination },
             CoordinationCheckpointGuardKind::Writer => Self::Writer { coordination },
+            CoordinationCheckpointGuardKind::SnapshotWriter => {
+                Self::SnapshotWriter { coordination }
+            }
         })
     }
 }
@@ -3020,6 +3078,10 @@ impl Drop for CheckpointLocks {
             }
             CheckpointLocks::Read0 { coordination } => {
                 coordination.release_checkpoint_guard(CoordinationCheckpointGuardKind::Read0);
+            }
+            CheckpointLocks::SnapshotWriter { coordination } => {
+                coordination
+                    .release_checkpoint_guard(CoordinationCheckpointGuardKind::SnapshotWriter);
             }
         }
     }
@@ -4695,6 +4757,34 @@ impl WalFile {
                         return Ok(IOResult::Done(CheckpointResult::new(
                             max_frame, nbackfills, 0,
                         )));
+                    }
+                    if !needs_backfill && retain_guard {
+                        let guard_kind = self.coordination.acquire_complete_snapshot_guard()?;
+                        let guard = match guard_kind {
+                            CoordinationCheckpointGuardKind::SnapshotWriter => {
+                                CheckpointLocks::SnapshotWriter {
+                                    coordination: self.coordination.clone(),
+                                }
+                            }
+                            unexpected => {
+                                self.coordination.release_checkpoint_guard(unexpected);
+                                return Err(LimboError::InternalError(
+                                    "complete snapshot guard returned the wrong lock kind".into(),
+                                ));
+                            }
+                        };
+                        let guarded_snapshot = self.load_coordination_snapshot();
+                        if guarded_snapshot.max_frame == guarded_snapshot.nbackfills {
+                            let mut result = CheckpointResult::new(
+                                guarded_snapshot.max_frame,
+                                guarded_snapshot.nbackfills,
+                                0,
+                            );
+                            result.maybe_guard = Some(guard);
+                            return Ok(IOResult::Done(result));
+                        }
+                        drop(guard);
+                        return Err(LimboError::Busy);
                     }
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
                     self.acquire_proper_checkpoint_guard(mode, lock_source)?;
