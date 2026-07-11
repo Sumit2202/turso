@@ -31,7 +31,7 @@ impl Connection {
     /// overwriting an existing path.
     ///
     /// This API is for ordinary-WAL databases opened with experimental
-    /// multiprocess WAL. It performs a durable TRUNCATE checkpoint and keeps
+    /// multiprocess WAL. It performs a durable FULL checkpoint and keeps
     /// the shared checkpoint and writer authority until a CoW clone is
     /// established. Filesystems without reflink support use `VACUUM INTO`
     /// under a shared-reader snapshot instead of copying the live database

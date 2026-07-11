@@ -434,7 +434,7 @@ fn snapshot_to_file_releases_writer_authority_after_clone_establishment() {
 }
 
 #[test]
-fn snapshot_to_file_checkpoint_busy_is_structured_and_publishes_no_target() {
+fn snapshot_to_file_full_checkpoint_busy_for_older_reader_publishes_no_target() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("snapshot-checkpoint-busy.db");
     let snapshot_path = dir.path().join("snapshot-checkpoint-busy-copy.db");
@@ -452,9 +452,12 @@ fn snapshot_to_file_checkpoint_busy_is_structured_and_publishes_no_target() {
 
     reader_conn.execute("begin").unwrap();
     assert_eq!(count_test_rows(&reader_conn), 1);
+    snapshot_conn
+        .execute("insert into test(value) values ('after-reader')")
+        .unwrap();
     let error = snapshot_conn
         .snapshot_to_file(&snapshot_path)
-        .expect_err("active reader must make the snapshot TRUNCATE checkpoint busy");
+        .expect_err("an older reader must make the snapshot FULL checkpoint busy");
     assert!(
         matches!(error, LimboError::Busy),
         "snapshot checkpoint contention must surface as structured Busy: {error:?}"
@@ -463,6 +466,34 @@ fn snapshot_to_file_checkpoint_busy_is_structured_and_publishes_no_target() {
         !snapshot_path.exists(),
         "a Busy snapshot must not publish a partial destination"
     );
+    reader_conn.execute("rollback").unwrap();
+}
+
+#[test]
+fn snapshot_to_file_full_checkpoint_allows_reader_at_latest_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("snapshot-current-reader.db");
+    let snapshot_path = dir.path().join("snapshot-current-reader-copy.db");
+    let db = open_multiprocess_db(multiprocess_test_io(), db_path.to_str().unwrap()).unwrap();
+    let snapshot_conn = db.connect().unwrap();
+    let reader_conn = db.connect().unwrap();
+    snapshot_conn.wal_auto_actions_disable();
+    reader_conn.wal_auto_actions_disable();
+    snapshot_conn
+        .execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    snapshot_conn
+        .execute("insert into test(value) values ('reader-snapshot')")
+        .unwrap();
+
+    reader_conn.execute("begin").unwrap();
+    assert_eq!(count_test_rows(&reader_conn), 1);
+    snapshot_conn.snapshot_to_file(&snapshot_path).unwrap();
+
+    let snapshot_db =
+        Database::open_file(multiprocess_test_io(), snapshot_path.to_str().unwrap()).unwrap();
+    let snapshot_reader = snapshot_db.connect().unwrap();
+    assert_eq!(count_test_rows(&snapshot_reader), 1);
     reader_conn.execute("rollback").unwrap();
 }
 

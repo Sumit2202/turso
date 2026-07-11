@@ -729,6 +729,11 @@ pub trait Wal: Debug + Send + Sync {
     fn should_checkpoint(&self) -> bool;
     fn checkpoint(&self, pager: &Pager, mode: CheckpointMode)
         -> Result<IOResult<CheckpointResult>>;
+    fn checkpoint_retaining_guard(
+        &self,
+        pager: &Pager,
+        mode: CheckpointMode,
+    ) -> Result<IOResult<CheckpointResult>>;
     fn install_durable_backfill_proof(
         &self,
         max_frame: u64,
@@ -3849,7 +3854,20 @@ impl Wal for WalFile {
         pager: &Pager,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
-        self.checkpoint_inner(pager, mode, CheckpointLockSource::Acquire)
+        self.checkpoint_inner(pager, mode, CheckpointLockSource::Acquire, false)
+            .inspect_err(|e| {
+                tracing::debug!("WAL checkpoint failed: {e}");
+                let _ = self.checkpoint_guard.write().take();
+                self.ongoing_checkpoint.write().state = CheckpointState::Start;
+            })
+    }
+
+    fn checkpoint_retaining_guard(
+        &self,
+        pager: &Pager,
+        mode: CheckpointMode,
+    ) -> Result<IOResult<CheckpointResult>> {
+        self.checkpoint_inner(pager, mode, CheckpointLockSource::Acquire, true)
             .inspect_err(|e| {
                 tracing::debug!("WAL checkpoint failed: {e}");
                 let _ = self.checkpoint_guard.write().take();
@@ -3867,6 +3885,7 @@ impl Wal for WalFile {
                 upper_bound_inclusive: None,
             },
             CheckpointLockSource::HeldByCaller,
+            false,
         )
         .inspect_err(|e| {
             tracing::debug!("WAL checkpoint failed: {e}");
@@ -4648,6 +4667,7 @@ impl WalFile {
         pager: &Pager,
         mode: CheckpointMode,
         lock_source: CheckpointLockSource,
+        retain_guard: bool,
     ) -> Result<IOResult<CheckpointResult>> {
         loop {
             let state = self.ongoing_checkpoint.read().state.clone();
@@ -4669,7 +4689,7 @@ impl WalFile {
                             { "max_frame": max_frame, "nbackfills": nbackfills }
                         );
                     }
-                    if !needs_backfill && !mode.should_restart_log() {
+                    if !needs_backfill && !mode.should_restart_log() && !retain_guard {
                         // there are no frames to copy over and we don't need to reset
                         // the log so we can return early success.
                         return Ok(IOResult::Done(CheckpointResult::new(
@@ -4906,7 +4926,8 @@ impl WalFile {
                     // during 'read_page', so the caller will use the result to determine if:
                     // a. the max frame == num wal frames (everything backfilled)
                     // b. the max frame > 0 (we have something to truncate)
-                    if checkpoint_result.should_truncate()
+                    if retain_guard
+                        || checkpoint_result.should_truncate()
                         || checkpoint_result.wal_checkpoint_backfilled > 0
                     {
                         // Backfilled frames are not globally durable until

@@ -4547,13 +4547,13 @@ impl Pager {
         )
     }
 
-    /// Run a durable TRUNCATE checkpoint and return with checkpoint and writer
-    /// authority still held. Dropping the returned result releases the guard.
+    /// Run a durable FULL checkpoint and return with checkpoint and writer
+    /// authority still held. FULL makes the database file self-contained while
+    /// allowing current readers to keep their snapshots; dropping the returned
+    /// result releases the guard.
     pub(crate) fn snapshot_checkpoint(&self) -> Result<IOResult<CheckpointResult>> {
         self.checkpoint_inner(
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
+            CheckpointMode::Full,
             crate::SyncMode::Full,
             true,
             CheckpointLockSource::Acquire,
@@ -4614,8 +4614,14 @@ impl Pager {
                     sync_mode,
                     clear_page_cache,
                 } => {
-                    let checkpoint_lock_source = self.checkpoint_state.read().lock_source;
+                    let checkpoint_state = self.checkpoint_state.read();
+                    let checkpoint_lock_source = checkpoint_state.lock_source;
+                    let retain_checkpoint_guard = checkpoint_state.retain_guard;
+                    drop(checkpoint_state);
                     let res = return_if_io!(match checkpoint_lock_source {
+                        CheckpointLockSource::Acquire if retain_checkpoint_guard => {
+                            wal.checkpoint_retaining_guard(self, mode)
+                        }
                         CheckpointLockSource::Acquire => wal.checkpoint(self, mode),
                         CheckpointLockSource::HeldByCaller => {
                             wal.vacuum_checkpoint_with_held_lock(self)
