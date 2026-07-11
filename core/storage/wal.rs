@@ -5449,16 +5449,6 @@ impl WalFileShared {
             );
             return sqlite3_ondisk::build_shared_wal(&file, io);
         }
-        if snapshot.nbackfills != 0
-            && authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive
-        {
-            tracing::debug!(
-                nbackfills = snapshot.nbackfills,
-                max_frame = snapshot.max_frame,
-                "rebuilding WAL state from disk because an exclusive reopen must conservatively clear published backfill progress"
-            );
-            return sqlite3_ondisk::build_shared_wal(&file, io);
-        }
         if snapshot.max_frame > snapshot.nbackfills
             && authority
                 .iter_latest_frames(0, snapshot.max_frame)

@@ -926,7 +926,7 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
 }
 
 #[test]
-fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_proof() {
+fn database_open_reuses_backfill_proof_after_same_generation_wal_append() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir
         .path()
@@ -971,6 +971,10 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
         snapshot_after_append.max_frame > snapshot_after_checkpoint.max_frame,
         "stale-proof coverage requires a WAL append after proof installation"
     );
+    assert_eq!(
+        snapshot_after_append.nbackfills, snapshot_after_checkpoint.nbackfills,
+        "same-generation append must preserve durable backfill progress"
+    );
 
     drop(conn);
     drop(db);
@@ -980,21 +984,95 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
-        reopened
+        !reopened
             .shared_wal
             .read()
             .metadata
             .loaded_from_disk_scan
             .load(Ordering::Acquire),
-        "reopen must rebuild from disk after a WAL append invalidates the tshm backfill proof"
+        "same-generation WAL append must not invalidate prior durable backfill proof"
+    );
+
+    let reopened_authority = reopened.shared_wal_coordination().unwrap().unwrap();
+    assert_eq!(
+        reopened_authority.snapshot(),
+        snapshot_after_append,
+        "trusted reopen must preserve both backfill progress and the appended WAL tail"
     );
 
     let reopened_conn = reopened.connect().unwrap();
     assert_eq!(
         count_test_rows(&reopened_conn),
         33,
-        "stale-proof reopen should preserve rows committed after the partial checkpoint"
+        "trusted-proof reopen should preserve rows committed after the partial checkpoint"
     );
+}
+
+#[test]
+fn exclusive_reopen_preserves_full_backfill_and_next_writer_restarts_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-full-checkpoint-restart.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.wal_auto_actions_disable();
+    conn.execute("create table test(id integer primary key, value blob)")
+        .unwrap();
+    conn.execute("begin immediate").unwrap();
+    for _ in 0..32 {
+        conn.execute("insert into test(value) values (randomblob(2048))")
+            .unwrap();
+    }
+    conn.execute("commit").unwrap();
+    run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    let checkpointed = authority.snapshot();
+    assert!(checkpointed.nbackfills > 0);
+    assert_eq!(checkpointed.max_frame, checkpointed.nbackfills);
+
+    drop(conn);
+    drop(db);
+    let mut manager = DATABASE_MANAGER.lock();
+    manager.clear();
+    drop(manager);
+
+    let reopened = open_multiprocess_db(io, db_path_str).unwrap();
+    assert!(
+        !reopened
+            .shared_wal
+            .read()
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire),
+        "valid full-backfill proof should survive exclusive reopen"
+    );
+    let reopened_conn = reopened.connect().unwrap();
+    reopened_conn
+        .execute("insert into test(value) values (randomblob(2048))")
+        .unwrap();
+
+    let restarted = reopened
+        .shared_wal_coordination()
+        .unwrap()
+        .unwrap()
+        .snapshot();
+    assert!(
+        restarted.checkpoint_seq > checkpointed.checkpoint_seq,
+        "first writer after trusted full-backfill reopen should restart the WAL"
+    );
+    assert!(
+        restarted.max_frame < checkpointed.max_frame,
+        "WAL restart should reset the active frame range before the new commit"
+    );
+    assert_eq!(count_test_rows(&reopened_conn), 33);
 }
 
 #[test]

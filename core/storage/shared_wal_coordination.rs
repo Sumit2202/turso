@@ -1371,7 +1371,10 @@ impl MappedSharedWalCoordination {
         checksum_2: u32,
         transaction_count: u64,
     ) {
-        self.clear_backfill_proof();
+        // Appending in the same WAL generation does not invalidate already
+        // durable backfill progress. The proof is tied to its backfill point,
+        // generation identity, and main-DB header rather than to the moving
+        // WAL tail. Restart/truncate and snapshot replacement clear it.
         self.with_snapshot_write(|header| {
             // Use fetch_max to ensure we never lower max_frame. In multi-process
             // mode, another process may have committed frames after ours, advancing
@@ -1513,12 +1516,17 @@ impl MappedSharedWalCoordination {
         if proof.crc32c() != stored_crc {
             return false;
         }
-        proof
-            == SharedWalBackfillProof::from_snapshot_and_db(
-                snapshot,
-                db_size_pages,
-                db_header_crc32c,
-            )
+        proof.nbackfills == snapshot.nbackfills
+            && proof.max_frame <= snapshot.max_frame
+            && proof.checkpoint_seq == snapshot.checkpoint_seq
+            && proof.page_size == snapshot.page_size
+            && proof.salt_1 == snapshot.salt_1
+            && proof.salt_2 == snapshot.salt_2
+            && proof.db_size_pages == db_size_pages
+            && proof.db_header_crc32c == db_header_crc32c
+            && (proof.max_frame != snapshot.max_frame
+                || (proof.checksum_1 == snapshot.checksum_1
+                    && proof.checksum_2 == snapshot.checksum_2))
     }
 
     /// Begin syncing the `.tshm` coordination file when the caller needs durable publication.
@@ -3506,7 +3514,7 @@ mod tests {
     }
 
     #[test]
-    fn mapped_shared_wal_coordination_publish_commit_clears_backfill_proof() {
+    fn mapped_shared_wal_coordination_publish_commit_preserves_backfill_proof() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination.tshm");
         let mapped = create_mapping(&path);
@@ -3531,13 +3539,16 @@ mod tests {
 
         mapped.publish_commit(15, 41, 43, 10);
 
-        assert!(!mapped.validate_backfill_proof(snapshot, 11, 0xAABB_CCDD));
+        let appended = mapped.snapshot();
+        assert_eq!(appended.max_frame, 15);
+        assert_eq!(appended.nbackfills, snapshot.nbackfills);
+        assert!(mapped.validate_backfill_proof(appended, 11, 0xAABB_CCDD));
         assert_eq!(
             mapped
                 .header()
                 .backfill_proof_version
                 .load(Ordering::Acquire),
-            0
+            SHARED_WAL_BACKFILL_PROOF_VERSION
         );
     }
 
