@@ -235,6 +235,17 @@ pub trait File: Send + Sync {
         ))
     }
 
+    /// Atomically replace an exclusive shared-WAL byte lock with a shared lock.
+    ///
+    /// Backends must not implement this as unlock-then-lock: protocol migration
+    /// relies on there being no interval in which an older process can acquire
+    /// the byte exclusively.
+    fn shared_wal_downgrade_lock_byte(&self, _offset: u64, _kind: SharedWalLockKind) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "atomic shared WAL coordination lock downgrade is not supported for this file".into(),
+        ))
+    }
+
     fn shared_wal_unlock_byte(&self, _offset: u64, _kind: SharedWalLockKind) -> Result<()> {
         Err(crate::LimboError::InternalError(
             "shared WAL coordination byte unlocking is not supported for this file".into(),

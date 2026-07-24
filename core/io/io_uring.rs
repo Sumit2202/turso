@@ -867,6 +867,10 @@ impl File for UringFile {
         unix_shared_wal_lock_byte(self.file.as_raw_fd(), offset, exclusive, false, kind)
     }
 
+    fn shared_wal_downgrade_lock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
+        unix_shared_wal_lock_byte(self.file.as_raw_fd(), offset, false, true, kind).map(|_| ())
+    }
+
     fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
         unix_shared_wal_unlock_byte(self.file.as_raw_fd(), offset, kind)
     }

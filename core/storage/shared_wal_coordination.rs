@@ -15,9 +15,9 @@
 //! - Shared memory is the source of truth across processes.
 //! - Process-local registries prevent same-process re-opens from reclaiming or
 //!   double-using slots that are still owned by sibling connections.
-//! - The shared frame index is append-only within a WAL generation and is only
-//!   published after each entry is fully written, so other processes never
-//!   observe half-written mappings.
+//! - The shared frame index has an immutable committed prefix within a WAL
+//!   generation. Rolled-back or crash-left suffix slots may be reused, and all
+//!   entry/hash access is atomic so readers never observe half-written mappings.
 //!
 //! Stale-owner reclamation is best-effort and must only trade performance for
 //! conservatism, never correctness: if the authority cannot prove a slot is
@@ -26,19 +26,19 @@
 use crate::{
     io::{Completion, File, FileSyncType, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO},
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering},
         Arc, LazyLock, Mutex, RwLock,
     },
     turso_assert, CompletionError, HashMap, LimboError, Result,
 };
-use std::mem::size_of;
+use std::mem::{align_of, size_of};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
 /// Durable file-format magic stored at the start of every `.tshm` mapping.
 const SHARED_WAL_COORDINATION_MAGIC: [u8; 8] = *b"TSHMWAL\0";
 /// Durable `.tshm` file-format version. Bump whenever persisted layout changes.
-const SHARED_WAL_COORDINATION_VERSION: u32 = 1;
+const SHARED_WAL_COORDINATION_VERSION: u32 = 2;
 /// Version for the optional persisted backfill-proof payload.
 const SHARED_WAL_BACKFILL_PROOF_VERSION: u32 = 1;
 /// Sentinel meaning a reader slot is not currently pinning any WAL frame.
@@ -55,6 +55,8 @@ const WRITER_LOCK_OFFSET: u64 = 1;
 const CHECKPOINT_LOCK_OFFSET: u64 = 2;
 /// Byte range starting at 3: one reader-byte lock per shared reader slot.
 const READER_LOCK_START_OFFSET: u64 = 3;
+/// Reserved high byte used as the version-2 validation/WAL-scan startup barrier.
+const OPEN_BARRIER_LOCK_OFFSET: u64 = 1 << 32;
 /// Entries per frame-index block in the append-only shared page->frame index.
 const FRAME_INDEX_BLOCK_CAPACITY: u32 = 4096;
 /// Open-addressing hash slots per frame-index block.
@@ -62,6 +64,8 @@ const FRAME_INDEX_BLOCK_CAPACITY: u32 = 4096;
 /// Mirroring SQLite's oversubscription keeps probe chains short without making
 /// each block materially larger.
 const FRAME_INDEX_BLOCK_HASH_SLOTS: u32 = FRAME_INDEX_BLOCK_CAPACITY * 2;
+/// Removed hash value that preserves a linear-probing chain during slot reuse.
+const FRAME_INDEX_BLOCK_HASH_TOMBSTONE: u16 = u16::MAX;
 /// Hard cap on reserved frame-index blocks in one `.tshm` generation.
 const MAX_FRAME_INDEX_BLOCKS: u32 = 64;
 /// Blocks provisioned on first open before the index grows lazily.
@@ -109,9 +113,42 @@ struct ProcessLocalCoordinationEntry {
 /// recognize "our own slot" without probing the cross-process lock.
 #[derive(Debug)]
 struct LocalLockState {
+    exclusive_lifetime_lock_held: bool,
+    open_barrier_lock_held: bool,
     writer_lock_held: bool,
     checkpoint_lock_held: bool,
     reader_locks: Vec<usize>,
+}
+
+struct SharedWalOpenBarrierGuard {
+    file: Arc<dyn File>,
+    lock_kind: SharedWalLockKind,
+    armed: bool,
+}
+
+impl SharedWalOpenBarrierGuard {
+    fn acquire(file: Arc<dyn File>, lock_kind: SharedWalLockKind) -> Result<Self> {
+        file.shared_wal_lock_byte(OPEN_BARRIER_LOCK_OFFSET, true, lock_kind)?;
+        Ok(Self {
+            file,
+            lock_kind,
+            armed: true,
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SharedWalOpenBarrierGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self
+                .file
+                .shared_wal_unlock_byte(OPEN_BARRIER_LOCK_OFFSET, self.lock_kind);
+        }
+    }
 }
 
 /// Per-connection ownership bookkeeping within a single process.
@@ -168,10 +205,6 @@ impl ProcessLocalOwnershipState {
     }
 
     /// Return whether any sibling connection in this process currently owns the writer slot.
-    fn writer_active(&self) -> bool {
-        self.writer_owner.is_some()
-    }
-
     /// Record that one local connection now owns the process-local checkpoint slot.
     fn try_acquire_checkpoint(&mut self, owner: SharedOwnerRecord) -> bool {
         if self.checkpoint_owner.is_some() {
@@ -587,15 +620,28 @@ struct SharedWalCoordinationMapHeader {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-/// One append-only page->frame mapping in the shared frame index.
+/// One page->frame mapping in the shared frame index.
 ///
-/// Entries are stored in monotonically increasing `frame_id` order so reverse
-/// scans can find the newest visible version of a page without sorting.
+/// The published prefix is stored in monotonically increasing `frame_id` order
+/// so reverse scans can find the newest visible version without sorting.
 struct SharedWalFrameIndexEntry {
+    page_id: AtomicU64,
+    frame_id: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SharedWalFrameIndexEntryValue {
     page_id: u64,
     frame_id: u64,
 }
+
+#[cfg(not(shuttle))]
+const _: () = {
+    assert!(size_of::<SharedWalFrameIndexEntry>() == 2 * size_of::<u64>());
+    assert!(align_of::<SharedWalFrameIndexEntry>() == align_of::<u64>());
+    assert!(size_of::<AtomicU16>() == size_of::<u16>());
+    assert!(align_of::<AtomicU16>() == align_of::<u16>());
+};
 
 /// How the tshm file was opened, determined at open time by probing byte 0.
 ///
@@ -690,7 +736,7 @@ struct FrameIndexBlockMapping {
     /// Start of the block's frame-index entry array.
     entries_ptr: NonNull<SharedWalFrameIndexEntry>,
     /// Start of the block's hash table region.
-    hash_ptr: NonNull<u16>,
+    hash_ptr: NonNull<AtomicU16>,
     /// Total mapped byte length for this block.
     byte_len: usize,
 }
@@ -714,7 +760,7 @@ impl std::fmt::Debug for MappedSharedWalCoordination {
 
 impl Drop for MappedSharedWalCoordination {
     fn drop(&mut self) {
-        self.release_owned_locks_on_drop();
+        let open_barrier_lock_held = self.release_owned_locks_on_drop();
         if let Some(path) = self.registry_path.as_ref() {
             let mut opens = PROCESS_LOCAL_COORDINATION_OPENS.lock();
             let count = opens
@@ -733,6 +779,11 @@ impl Drop for MappedSharedWalCoordination {
         let _ = self
             .file
             .shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, self.lock_kind());
+        if open_barrier_lock_held {
+            let _ = self
+                .file
+                .shared_wal_unlock_byte(OPEN_BARRIER_LOCK_OFFSET, self.lock_kind());
+        }
     }
 }
 
@@ -788,6 +839,8 @@ impl MappedSharedWalCoordination {
                 reader_slot_count,
             ))),
             local_lock_state: Mutex::new(LocalLockState {
+                exclusive_lifetime_lock_held: open_mode == SharedWalCoordinationOpenMode::Exclusive,
+                open_barrier_lock_held: true,
                 writer_lock_held: false,
                 checkpoint_lock_held: false,
                 reader_locks: vec![0; reader_slot_count as usize],
@@ -927,6 +980,7 @@ impl MappedSharedWalCoordination {
             LimboError::InternalError("shared WAL coordination path is not valid UTF-8".into())
         })?)?;
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
+        let mut open_barrier = SharedWalOpenBarrierGuard::acquire(file.clone(), lock_kind)?;
         let open_mode = Self::detect_open_mode(&file, lock_kind, base_len)?;
         let metadata_len = file.size()? as usize;
         let initialize = metadata_len == 0
@@ -953,6 +1007,7 @@ impl MappedSharedWalCoordination {
             ownership_mode,
             open_mode,
         );
+        open_barrier.disarm();
         if initialize {
             region.initialize(reader_slot_count);
         } else if let Err(err) = region.validate_existing(reader_slot_count, metadata_len) {
@@ -1009,6 +1064,7 @@ impl MappedSharedWalCoordination {
             Err(err) => return Err(err),
         };
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
+        let mut open_barrier = SharedWalOpenBarrierGuard::acquire(file.clone(), lock_kind)?;
         let open_mode = Self::detect_open_mode(&file, lock_kind, base_len)?;
         let metadata_len = file.size()? as usize;
         if metadata_len < base_len {
@@ -1029,10 +1085,8 @@ impl MappedSharedWalCoordination {
             ownership_mode,
             open_mode,
         );
+        open_barrier.disarm();
         if let Err(err) = region.validate_existing(reader_slot_count, metadata_len) {
-            region
-                .file
-                .shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
             return Err(err);
         }
         let mapped_blocks = region.header().frame_index_blocks.load(Ordering::Acquire);
@@ -1057,25 +1111,36 @@ impl MappedSharedWalCoordination {
     fn detect_open_mode(
         file: &Arc<dyn File>,
         lock_kind: SharedWalLockKind,
-        base_len: usize,
+        _base_len: usize,
     ) -> Result<SharedWalCoordinationOpenMode> {
-        let metadata_len_before_probe = file.size()? as usize;
         match file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, lock_kind)? {
-            true => {
-                file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
-                Self::reacquire_shared_lifetime_lock(file, lock_kind)?;
-                let metadata_len_after_probe = file.size()? as usize;
-                if metadata_len_before_probe < base_len && metadata_len_after_probe >= base_len {
-                    Ok(SharedWalCoordinationOpenMode::MultiProcess)
-                } else {
-                    Ok(SharedWalCoordinationOpenMode::Exclusive)
-                }
-            }
+            true => Ok(SharedWalCoordinationOpenMode::Exclusive),
             false => {
                 Self::reacquire_shared_lifetime_lock(file, lock_kind)?;
                 Ok(SharedWalCoordinationOpenMode::MultiProcess)
             }
         }
+    }
+
+    /// Finish versioned startup after WAL-scan reconciliation.
+    ///
+    /// The open barrier serializes version-2 openers while the process that
+    /// observed an unused map retains the exclusive lifetime lock through
+    /// validation, migration, and seeding. Downgrade the lifetime lock before
+    /// releasing the barrier so later openers can only observe a complete map.
+    pub(crate) fn finish_open(&self) -> Result<()> {
+        let mut local = self.local_lock_state.lock();
+        if local.exclusive_lifetime_lock_held {
+            self.file
+                .shared_wal_downgrade_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, self.lock_kind())?;
+            local.exclusive_lifetime_lock_held = false;
+        }
+        if local.open_barrier_lock_held {
+            self.file
+                .shared_wal_unlock_byte(OPEN_BARRIER_LOCK_OFFSET, self.lock_kind())?;
+            local.open_barrier_lock_held = false;
+        }
+        Ok(())
     }
 
     /// Return whether dropping this mapping would leave no other process with
@@ -1084,6 +1149,9 @@ impl MappedSharedWalCoordination {
     /// Close-time shutdown checkpointing uses this to approximate SQLite's
     /// "last connection cleans up shared state" behavior.
     pub(crate) fn is_last_process_mapping(&self) -> bool {
+        if self.local_lock_state.lock().exclusive_lifetime_lock_held {
+            return true;
+        }
         if !matches!(
             self.file.shared_wal_try_lock_byte(
                 PROCESS_LIFETIME_LOCK_OFFSET,
@@ -1094,11 +1162,23 @@ impl MappedSharedWalCoordination {
         ) {
             return false;
         }
-        let _ = self
+        match self
             .file
-            .shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, self.lock_kind());
-        let _ = Self::reacquire_shared_lifetime_lock(&self.file, self.lock_kind());
-        true
+            .shared_wal_downgrade_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, self.lock_kind())
+        {
+            Ok(()) => true,
+            Err(error) => {
+                // A failed downgrade must remain fail-closed. Track the
+                // exclusive lock so this mapping's eventual Drop releases it;
+                // never create an unlock/relock interval as a fallback.
+                self.local_lock_state.lock().exclusive_lifetime_lock_held = true;
+                tracing::error!(
+                    %error,
+                    "failed atomically downgrading shared WAL lifetime lock after last-process probe"
+                );
+                false
+            }
+        }
     }
 
     /// Best-effort cleanup for locks held by this mapping.
@@ -1106,15 +1186,23 @@ impl MappedSharedWalCoordination {
     /// This must tolerate partially stale owner fields because drop can run
     /// during error unwinding or after external repair paths have already
     /// cleared shared metadata.
-    fn release_owned_locks_on_drop(&mut self) {
-        let (writer_lock_held, checkpoint_lock_held, reader_locks) = {
+    fn release_owned_locks_on_drop(&mut self) -> bool {
+        let (open_barrier_lock_held, writer_lock_held, checkpoint_lock_held, reader_locks) = {
             let mut local = self.local_lock_state.lock();
+            let open_barrier_lock_held = local.open_barrier_lock_held;
             let writer_lock_held = local.writer_lock_held;
             let checkpoint_lock_held = local.checkpoint_lock_held;
             let reader_locks = std::mem::take(&mut local.reader_locks);
+            local.exclusive_lifetime_lock_held = false;
+            local.open_barrier_lock_held = false;
             local.writer_lock_held = false;
             local.checkpoint_lock_held = false;
-            (writer_lock_held, checkpoint_lock_held, reader_locks)
+            (
+                open_barrier_lock_held,
+                writer_lock_held,
+                checkpoint_lock_held,
+                reader_locks,
+            )
         };
 
         if writer_lock_held {
@@ -1198,6 +1286,11 @@ impl MappedSharedWalCoordination {
             let bit = slot_index & 63;
             self.reader_bitmap_words()[word_idx].fetch_or(1u64 << bit, Ordering::Release);
         }
+
+        // Drop releases lifetime before this barrier. A waiting v2 opener must
+        // not classify an unfinished map as multiprocess while this opener is
+        // still tearing down its exclusive startup state.
+        open_barrier_lock_held
     }
 
     /// Read a consistent snapshot of the shared coordination header.
@@ -1233,6 +1326,16 @@ impl MappedSharedWalCoordination {
 
     pub(crate) const fn open_mode(&self) -> SharedWalCoordinationOpenMode {
         self.open_mode
+    }
+
+    /// Whether this mapping still owns the one-shot exclusive startup window.
+    ///
+    /// `open_mode` is historical telemetry. Recovery decisions must use this
+    /// current lock state so later connections cannot re-enter startup repair.
+    pub(crate) fn exclusive_startup_ownership_held(&self) -> bool {
+        self.with_local_lock_state(|local| {
+            local.exclusive_lifetime_lock_held && local.open_barrier_lock_held
+        })
     }
 
     /// Return whether exclusive open sanitized an invalid persisted backfill proof.
@@ -1305,10 +1408,16 @@ impl MappedSharedWalCoordination {
     /// probes here is weaker and can misclassify recycled PIDs as live.
     pub(crate) fn repair_transient_state_for_exclusive_open(&self) {
         let header = self.header();
-        header.writer_owner.store(UNOWNED_LOCK, Ordering::Release);
-        header
-            .checkpoint_owner
-            .store(UNOWNED_LOCK, Ordering::Release);
+        let (writer_held, checkpoint_held) = self
+            .with_local_lock_state(|entry| (entry.writer_lock_held, entry.checkpoint_lock_held));
+        if !writer_held {
+            header.writer_owner.store(UNOWNED_LOCK, Ordering::Release);
+        }
+        if !checkpoint_held {
+            header
+                .checkpoint_owner
+                .store(UNOWNED_LOCK, Ordering::Release);
+        }
 
         // For reader slots, we must check byte-range locks before
         // clearing: another live process may hold a slot. Blindly clearing
@@ -1761,6 +1870,7 @@ impl MappedSharedWalCoordination {
                 .writer_owner
                 .store(owner.raw(), Ordering::Release);
         }
+        self.trim_frame_index_to_published_tail_after_writer_acquire();
         true
     }
 
@@ -1818,23 +1928,6 @@ impl MappedSharedWalCoordination {
                 true
             }
         }
-    }
-
-    /// Determine whether the writer or checkpoint lock is currently held by any process.
-    pub(crate) fn writer_or_checkpoint_lock_active(&self) -> bool {
-        let (writer_held, checkpoint_held) = self
-            .with_local_lock_state(|entry| (entry.writer_lock_held, entry.checkpoint_lock_held));
-        if self.uses_linux_ofd_locking() {
-            return self.byte_lock_is_held(WRITER_LOCK_OFFSET, writer_held)
-                || self.byte_lock_is_held(CHECKPOINT_LOCK_OFFSET, checkpoint_held);
-        }
-        if self.with_process_local_ownership(|entry| {
-            entry.writer_active() || entry.checkpoint_active()
-        }) {
-            return true;
-        }
-        self.byte_lock_is_held(WRITER_LOCK_OFFSET, false)
-            || self.byte_lock_is_held(CHECKPOINT_LOCK_OFFSET, false)
     }
 
     /// Determine whether the checkpoint lock is currently held by any process.
@@ -2287,9 +2380,9 @@ impl MappedSharedWalCoordination {
     /// Append a (page_id, frame_id) entry to the shared frame index.
     ///
     /// Called by the writer after each WAL frame is written. The frame index
-    /// is an append-only log of page→frame mappings that grows in fixed-size
-    /// blocks. Readers use it to find the latest WAL frame for a given page
-    /// without scanning the WAL file.
+    /// has an immutable committed prefix and grows in fixed-size blocks.
+    /// Readers use it to find the latest WAL frame for a given page without
+    /// scanning the WAL file. Rolled-back suffix slots may be reused.
     ///
     /// The entry is written behind `frame_index_publish_lock`, and the
     /// `frame_index_len` counter is bumped with Release ordering only after
@@ -2299,6 +2392,19 @@ impl MappedSharedWalCoordination {
     /// is reset to empty before appending.
     #[track_caller]
     pub(crate) fn record_frame(&self, page_id: u64, frame_id: u64) {
+        turso_assert!(
+            self.writer_lock_held_by_this_mapping(),
+            "recording a shared WAL frame requires writer ownership"
+        );
+        self.record_frame_locked(page_id, frame_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_frame_for_test(&self, page_id: u64, frame_id: u64) {
+        self.record_frame_locked(page_id, frame_id);
+    }
+
+    fn record_frame_locked(&self, page_id: u64, frame_id: u64) {
         let _publish_guard = self.frame_index_publish_lock.lock();
         let header = self.header();
         if frame_id == 1 && header.max_frame.load(Ordering::Acquire) == 0 {
@@ -2349,12 +2455,31 @@ impl MappedSharedWalCoordination {
         let local_index = slot % FRAME_INDEX_BLOCK_CAPACITY;
         if local_index == 0 {
             Self::clear_frame_index_block_hash(&mappings[block_index as usize]);
+        } else {
+            let replaced = Self::frame_index_entry(&mappings, slot);
+            if replaced.frame_id != 0 {
+                Self::remove_frame_index_block_hash(
+                    &mappings[block_index as usize],
+                    local_index,
+                    replaced.page_id,
+                );
+            }
         }
         unsafe {
-            std::ptr::addr_of_mut!((*entry).page_id).write(page_id);
-            std::ptr::addr_of_mut!((*entry).frame_id).write(frame_id);
+            (*entry).page_id.store(page_id, Ordering::Relaxed);
+            (*entry).frame_id.store(frame_id, Ordering::Release);
         }
-        Self::insert_frame_index_block_hash(&mappings[block_index as usize], local_index, page_id);
+        if !Self::insert_frame_index_block_hash(
+            &mappings[block_index as usize],
+            local_index,
+            page_id,
+        ) {
+            // A saturated or inconsistent persisted hash must not prevent the
+            // complete frame index from being published. Force readers onto
+            // the correctness-first fallback until an exclusive reopen
+            // rebuilds the block.
+            header.frame_index_overflowed.store(1, Ordering::Release);
+        }
         // Publish the new entry only after its payload is fully written, so
         // readers that synchronize via frame_index_len never observe an
         // uninitialized slot.
@@ -2397,17 +2522,61 @@ impl MappedSharedWalCoordination {
             return;
         }
         header.frame_index_len.store(new_len, Ordering::Release);
-        if new_len == 0 {
+        // Do not rebuild the shared hash in place while readers may inspect
+        // it. Hash values beyond new_len remain filtered by the reader's
+        // visible prefix; a later append tombstones each value as it reuses
+        // the corresponding frame slot.
+    }
+
+    /// Trim entries beyond the authoritative committed tail after acquiring
+    /// the cross-process writer lock. A crashed writer can leave an invisible
+    /// suffix in the durable index; the next writer owns recovery because no
+    /// other process can still be appending that suffix.
+    ///
+    /// Hash entries are left in place until their frame slot is reused. The
+    /// reuser replaces each old hash value with a probe-chain tombstone before
+    /// publishing the new entry, so readers that captured the old index length
+    /// remain race-free and repeated rewrites do not exhaust the hash table.
+    fn trim_frame_index_to_published_tail_after_writer_acquire(&self) {
+        turso_assert!(
+            self.writer_lock_held_by_this_mapping(),
+            "trimming a shared WAL frame-index suffix requires writer ownership"
+        );
+        let _publish_guard = self.frame_index_publish_lock.lock();
+        let header = self.header();
+        let max_frame = header.max_frame.load(Ordering::Acquire);
+        let len = header
+            .frame_index_len
+            .load(Ordering::Acquire)
+            .min(header.frame_index_capacity);
+        if len == 0 {
             return;
         }
-        let retained_entries = new_len % FRAME_INDEX_BLOCK_CAPACITY;
-        if retained_entries != 0 {
-            let retained_block = (new_len - 1) / FRAME_INDEX_BLOCK_CAPACITY;
-            Self::rebuild_frame_index_block_hash(
-                &mappings[retained_block as usize],
-                retained_entries,
+        let old_blocks = len.div_ceil(FRAME_INDEX_BLOCK_CAPACITY);
+        self.ensure_mapped_frame_index_blocks(old_blocks)
+            .expect("shared WAL frame index block missing");
+        let mappings = self.frame_index_blocks.read();
+        let mut new_len = len;
+        while new_len > 0 {
+            let last = Self::frame_index_entry(&mappings, new_len - 1);
+            if last.frame_id <= max_frame {
+                break;
+            }
+            new_len -= 1;
+        }
+        if new_len != len {
+            header.frame_index_len.store(new_len, Ordering::Release);
+            tracing::warn!(
+                old_frame_index_len = len,
+                new_frame_index_len = new_len,
+                published_max_frame = max_frame,
+                "trimmed stale shared WAL frame-index suffix after writer acquisition"
             );
         }
+    }
+
+    pub(crate) fn writer_lock_held_by_this_mapping(&self) -> bool {
+        self.with_local_lock_state(|local| local.writer_lock_held)
     }
 
     /// Look up the latest WAL frame containing `page_id` within the visible
@@ -2538,7 +2707,7 @@ impl MappedSharedWalCoordination {
     }
 
     fn frame_index_block_hash_bytes() -> usize {
-        FRAME_INDEX_BLOCK_HASH_SLOTS as usize * size_of::<u16>()
+        FRAME_INDEX_BLOCK_HASH_SLOTS as usize * size_of::<AtomicU16>()
     }
 
     fn frame_index_block_byte_len() -> usize {
@@ -2610,7 +2779,7 @@ impl MappedSharedWalCoordination {
         let hash_ptr = NonNull::new(unsafe {
             ptr.as_ptr()
                 .add(Self::frame_index_block_entry_bytes())
-                .cast::<u16>()
+                .cast::<AtomicU16>()
         })
         .expect("mmap returned null");
         Ok(FrameIndexBlockMapping {
@@ -2655,8 +2824,15 @@ impl MappedSharedWalCoordination {
     fn frame_index_entry(
         mappings: &[FrameIndexBlockMapping],
         slot: u32,
-    ) -> SharedWalFrameIndexEntry {
-        unsafe { *Self::frame_index_entry_ptr(mappings, slot) }
+    ) -> SharedWalFrameIndexEntryValue {
+        let entry = Self::frame_index_entry_ptr(mappings, slot);
+        unsafe {
+            let frame_id = (*entry).frame_id.load(Ordering::Acquire);
+            SharedWalFrameIndexEntryValue {
+                page_id: (*entry).page_id.load(Ordering::Acquire),
+                frame_id,
+            }
+        }
     }
 
     fn frame_index_entry_ptr(
@@ -2668,17 +2844,16 @@ impl MappedSharedWalCoordination {
         unsafe { mappings[block_index].entries_ptr.as_ptr().add(entry_index) }
     }
 
-    fn frame_index_block_hash_ptr(mapping: &FrameIndexBlockMapping) -> *mut u16 {
+    fn frame_index_block_hash_ptr(mapping: &FrameIndexBlockMapping) -> *mut AtomicU16 {
         mapping.hash_ptr.as_ptr()
     }
 
     fn clear_frame_index_block_hash(mapping: &FrameIndexBlockMapping) {
-        unsafe {
-            std::ptr::write_bytes(
-                Self::frame_index_block_hash_ptr(mapping),
-                0,
-                FRAME_INDEX_BLOCK_HASH_SLOTS as usize,
-            );
+        let hash_ptr = Self::frame_index_block_hash_ptr(mapping);
+        for slot in 0..FRAME_INDEX_BLOCK_HASH_SLOTS as usize {
+            unsafe {
+                (*hash_ptr.add(slot)).store(0, Ordering::Release);
+            }
         }
     }
 
@@ -2696,7 +2871,7 @@ impl MappedSharedWalCoordination {
         mapping: &FrameIndexBlockMapping,
         local_index: u32,
         page_id: u64,
-    ) {
+    ) -> bool {
         turso_assert!(
             local_index < FRAME_INDEX_BLOCK_CAPACITY,
             "frame index block local index out of range"
@@ -2706,25 +2881,48 @@ impl MappedSharedWalCoordination {
         let value = (local_index + 1) as u16;
         for _ in 0..FRAME_INDEX_BLOCK_HASH_SLOTS {
             unsafe {
-                if std::ptr::read(hash_ptr.add(slot)) == 0 {
-                    std::ptr::write(hash_ptr.add(slot), value);
-                    return;
+                let hash_entry = &*hash_ptr.add(slot);
+                let observed = hash_entry.load(Ordering::Acquire);
+                if (observed == 0 || observed == FRAME_INDEX_BLOCK_HASH_TOMBSTONE)
+                    && hash_entry
+                        .compare_exchange(observed, value, Ordering::Release, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    return true;
                 }
             }
             slot = (slot + 1) % FRAME_INDEX_BLOCK_HASH_SLOTS as usize;
         }
-        panic!("shared WAL frame index block hash table is full");
+        false
     }
 
-    fn rebuild_frame_index_block_hash(mapping: &FrameIndexBlockMapping, visible_entries: u32) {
-        turso_assert!(
-            visible_entries <= FRAME_INDEX_BLOCK_CAPACITY,
-            "visible block entries out of range"
-        );
-        Self::clear_frame_index_block_hash(mapping);
-        for local_index in 0..visible_entries {
-            let entry = unsafe { *mapping.entries_ptr.as_ptr().add(local_index as usize) };
-            Self::insert_frame_index_block_hash(mapping, local_index, entry.page_id);
+    fn remove_frame_index_block_hash(
+        mapping: &FrameIndexBlockMapping,
+        local_index: u32,
+        page_id: u64,
+    ) {
+        let hash_ptr = Self::frame_index_block_hash_ptr(mapping);
+        let mut slot = Self::hash_page_id(page_id);
+        let expected = (local_index + 1) as u16;
+        for _ in 0..FRAME_INDEX_BLOCK_HASH_SLOTS {
+            let hash_entry = unsafe { &*hash_ptr.add(slot) };
+            let observed = hash_entry.load(Ordering::Acquire);
+            if observed == 0 {
+                return;
+            }
+            if observed == expected
+                && hash_entry
+                    .compare_exchange(
+                        expected,
+                        FRAME_INDEX_BLOCK_HASH_TOMBSTONE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                return;
+            }
+            slot = (slot + 1) % FRAME_INDEX_BLOCK_HASH_SLOTS as usize;
         }
     }
 
@@ -2736,18 +2934,17 @@ impl MappedSharedWalCoordination {
         if visible_entries == 0 {
             return None;
         }
-        let hash = unsafe {
-            std::slice::from_raw_parts(
-                mapping.hash_ptr.as_ptr(),
-                FRAME_INDEX_BLOCK_HASH_SLOTS as usize,
-            )
-        };
         let mut slot = Self::hash_page_id(page_id);
         let mut latest = None;
         for _ in 0..FRAME_INDEX_BLOCK_HASH_SLOTS {
-            let local_plus_one = hash[slot];
+            let local_plus_one =
+                unsafe { (*mapping.hash_ptr.as_ptr().add(slot)).load(Ordering::Acquire) };
             if local_plus_one == 0 {
                 break;
+            }
+            if local_plus_one == FRAME_INDEX_BLOCK_HASH_TOMBSTONE {
+                slot = (slot + 1) % FRAME_INDEX_BLOCK_HASH_SLOTS as usize;
+                continue;
             }
             let local_index = local_plus_one as u32 - 1;
             if local_index >= visible_entries {
@@ -2755,9 +2952,10 @@ impl MappedSharedWalCoordination {
                 // does not terminate the probe chain — valid entries may follow.
                 // (A writer may have built the hash with more entries than this
                 // reader's snapshot makes visible.)
+                slot = (slot + 1) % FRAME_INDEX_BLOCK_HASH_SLOTS as usize;
                 continue;
             }
-            let entry = unsafe { *mapping.entries_ptr.as_ptr().add(local_index as usize) };
+            let entry = Self::frame_index_entry(std::slice::from_ref(mapping), local_index);
             if entry.page_id == page_id {
                 latest = Some(local_index);
             }
@@ -2770,22 +2968,18 @@ impl MappedSharedWalCoordination {
         mapping: &FrameIndexBlockMapping,
         visible_entries: u32,
     ) -> HashMap<u64, u32> {
-        let hash = unsafe {
-            std::slice::from_raw_parts(
-                mapping.hash_ptr.as_ptr(),
-                FRAME_INDEX_BLOCK_HASH_SLOTS as usize,
-            )
-        };
         let mut latest_entries: HashMap<u64, u32> = HashMap::default();
-        for &local_plus_one in hash {
-            if local_plus_one == 0 {
+        for slot in 0..FRAME_INDEX_BLOCK_HASH_SLOTS as usize {
+            let local_plus_one =
+                unsafe { (*mapping.hash_ptr.as_ptr().add(slot)).load(Ordering::Acquire) };
+            if local_plus_one == 0 || local_plus_one == FRAME_INDEX_BLOCK_HASH_TOMBSTONE {
                 continue;
             }
             let local_index = local_plus_one as u32 - 1;
             if local_index >= visible_entries {
                 continue;
             }
-            let entry = unsafe { *mapping.entries_ptr.as_ptr().add(local_index as usize) };
+            let entry = Self::frame_index_entry(std::slice::from_ref(mapping), local_index);
             latest_entries
                 .entry(entry.page_id)
                 .and_modify(|latest| *latest = (*latest).max(local_index))
@@ -2986,16 +3180,21 @@ mod tests {
     }
 
     fn create_mapping(path: &Path) -> MappedSharedWalCoordination {
-        MappedSharedWalCoordination::create_or_open(&test_shared_wal_io(), path, 64).unwrap()
+        let mapping =
+            MappedSharedWalCoordination::create_or_open(&test_shared_wal_io(), path, 64).unwrap();
+        mapping.finish_open().unwrap();
+        mapping
     }
 
     fn create_process_scoped_mapping(path: &Path) -> MappedSharedWalCoordination {
-        MappedSharedWalCoordination::create_or_open_process_scoped_for_tests(
+        let mapping = MappedSharedWalCoordination::create_or_open_process_scoped_for_tests(
             &test_shared_wal_io(),
             path,
             64,
         )
-        .unwrap()
+        .unwrap();
+        mapping.finish_open().unwrap();
+        mapping
     }
 
     fn exited_child_pid() -> u32 {
@@ -3259,8 +3458,8 @@ mod tests {
         let path = dir.path().join("coordination.tshm");
         let mapped = create_mapping(&path);
 
-        mapped.record_frame(7, 2);
-        mapped.record_frame(9, 4);
+        mapped.record_frame_for_test(7, 2);
+        mapped.record_frame_for_test(9, 4);
         mapped
             .header()
             .writer_owner
@@ -3291,8 +3490,8 @@ mod tests {
         let mapped_a = create_mapping(&path);
         let mapped_b = create_mapping(&path);
 
-        mapped_a.record_frame(7, 2);
-        mapped_a.record_frame(9, 4);
+        mapped_a.record_frame_for_test(7, 2);
+        mapped_a.record_frame_for_test(9, 4);
         let reader = mapped_b
             .register_reader(mapped_b.owner_record(), 4)
             .unwrap();
@@ -3928,9 +4127,9 @@ mod tests {
         let path = dir.path().join("coordination.tshm");
         let mapped = create_mapping(&path);
 
-        mapped.record_frame(7, 2);
-        mapped.record_frame(9, 4);
-        mapped.record_frame(7, 5);
+        mapped.record_frame_for_test(7, 2);
+        mapped.record_frame_for_test(9, 4);
+        mapped.record_frame_for_test(7, 5);
 
         assert_eq!(mapped.find_frame(7, 0, 5, None), Some(5));
         assert_eq!(mapped.find_frame(7, 0, 5, Some(4)), Some(2));
@@ -3953,7 +4152,7 @@ mod tests {
             .enumerate()
             .map(|(idx, page_id)| ((idx + 1) as u64, page_id as u64))
         {
-            mapped.record_frame(page_id, frame_id);
+            mapped.record_frame_for_test(page_id, frame_id);
         }
 
         assert_eq!(mapped.find_frame(1066, 0, 11, None), Some(9));
@@ -3968,11 +4167,11 @@ mod tests {
         let mapped = create_mapping(&path);
         let boundary = FRAME_INDEX_BLOCK_CAPACITY as u64;
 
-        mapped.record_frame(7, 2);
+        mapped.record_frame_for_test(7, 2);
         for frame_id in 3..=boundary + 1 {
-            mapped.record_frame(100 + (frame_id % 17), frame_id);
+            mapped.record_frame_for_test(100 + (frame_id % 17), frame_id);
         }
-        mapped.record_frame(7, boundary + 2);
+        mapped.record_frame_for_test(7, boundary + 2);
 
         let header = mapped.header();
         assert_eq!(
@@ -4003,10 +4202,10 @@ mod tests {
                 2 => 9,
                 _ => 11,
             };
-            mapped.record_frame(page_id, frame_id);
+            mapped.record_frame_for_test(page_id, frame_id);
         }
-        mapped.record_frame(9, boundary + 1);
-        mapped.record_frame(13, boundary + 2);
+        mapped.record_frame_for_test(9, boundary + 1);
+        mapped.record_frame_for_test(13, boundary + 2);
 
         assert_eq!(
             mapped.iter_latest_frames(0, boundary + 2),
@@ -4030,7 +4229,7 @@ mod tests {
             .frame_index_len
             .store(header.frame_index_capacity, Ordering::Release);
 
-        mapped.record_frame(7, 2);
+        mapped.record_frame_for_test(7, 2);
         assert_eq!(
             header.frame_index_len.load(Ordering::Acquire),
             header.frame_index_capacity
@@ -4046,17 +4245,17 @@ mod tests {
         let path = dir.path().join("coordination.tshm");
         let mapped = create_mapping(&path);
 
-        mapped.record_frame(7, 1);
-        mapped.record_frame(9, 2);
-        mapped.record_frame(7, 3);
-        mapped.record_frame(11, 4);
+        mapped.record_frame_for_test(7, 1);
+        mapped.record_frame_for_test(9, 2);
+        mapped.record_frame_for_test(7, 3);
+        mapped.record_frame_for_test(11, 4);
 
         mapped.rollback_frames(2);
         assert_eq!(mapped.find_frame(7, 0, 2, None), Some(1));
         assert_eq!(mapped.find_frame(11, 0, 2, None), None);
 
-        mapped.record_frame(15, 3);
-        mapped.record_frame(7, 4);
+        mapped.record_frame_for_test(15, 3);
+        mapped.record_frame_for_test(7, 4);
         assert_eq!(mapped.find_frame(7, 0, 4, None), Some(4));
         assert_eq!(mapped.find_frame(15, 0, 4, None), Some(3));
     }
@@ -4068,15 +4267,49 @@ mod tests {
         let mapped = create_mapping(&path);
         let header = mapped.header();
 
-        mapped.record_frame(7, 2);
-        mapped.record_frame(9, 4);
+        mapped.record_frame_for_test(7, 2);
+        mapped.record_frame_for_test(9, 4);
         header.max_frame.store(0, Ordering::Release);
 
-        mapped.record_frame(11, 1);
+        mapped.record_frame_for_test(11, 1);
 
         assert_eq!(header.frame_index_len.load(Ordering::Acquire), 1);
         assert_eq!(mapped.find_frame(11, 0, 1, None), Some(1));
         assert_eq!(mapped.find_frame(7, 0, 1, None), None);
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_repairs_stale_suffix_only_after_writer_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped_a = create_mapping(&path);
+        let mapped_b = create_mapping(&path);
+        let header = mapped_a.header();
+
+        for frame_id in 1..=9 {
+            mapped_a.record_frame_for_test(100 + frame_id, frame_id);
+        }
+        header.max_frame.store(9, Ordering::Release);
+
+        assert!(mapped_a.try_acquire_writer(mapped_a.owner_record()));
+        for frame_id in 10..=19 {
+            mapped_a.record_frame(100 + frame_id, frame_id);
+        }
+        assert!(!mapped_b.try_acquire_writer(mapped_b.owner_record()));
+        assert_eq!(header.frame_index_len.load(Ordering::Acquire), 19);
+
+        // Model writer A exiting before commit/rollback: once ownership moves
+        // to B, max_frame proves that 10..=19 are an unpublished stale suffix.
+        mapped_a.release_writer(mapped_a.owner_record());
+        assert!(mapped_b.try_acquire_writer(mapped_b.owner_record()));
+        assert_eq!(header.frame_index_len.load(Ordering::Acquire), 9);
+        mapped_b.record_frame(777, 10);
+        mapped_b.release_writer(mapped_b.owner_record());
+
+        assert_eq!(header.frame_index_len.load(Ordering::Acquire), 10);
+        assert_eq!(mapped_b.find_frame(777, 0, 10, None), Some(10));
+        assert_eq!(mapped_b.find_frame(119, 0, 10, None), None);
+        assert!(!mapped_b.frame_index_overflowed());
     }
 
     #[test]
@@ -4086,9 +4319,9 @@ mod tests {
         let mapped = create_mapping(&path);
         let mut snapshot = mapped.snapshot();
 
-        mapped.record_frame(7, 2);
-        mapped.record_frame(9, 4);
-        mapped.record_frame(11, 6);
+        mapped.record_frame_for_test(7, 2);
+        mapped.record_frame_for_test(9, 4);
+        mapped.record_frame_for_test(11, 6);
 
         snapshot.max_frame = 2;
         mapped.install_snapshot(snapshot);
@@ -4097,7 +4330,7 @@ mod tests {
         assert_eq!(mapped.find_frame(7, 0, 2, None), Some(2));
         assert_eq!(mapped.find_frame(9, 0, 2, None), None);
 
-        mapped.record_frame(13, 3);
+        mapped.record_frame_for_test(13, 3);
         assert_eq!(mapped.find_frame(13, 0, 3, None), Some(3));
     }
 
@@ -4108,11 +4341,11 @@ mod tests {
         let mapped = create_mapping(&path);
         let colliding = colliding_page_ids(3);
 
-        mapped.record_frame(colliding[0], 2);
-        mapped.record_frame(colliding[1], 4);
-        mapped.record_frame(colliding[0], 6);
-        mapped.record_frame(colliding[2], 8);
-        mapped.record_frame(colliding[1], 10);
+        mapped.record_frame_for_test(colliding[0], 2);
+        mapped.record_frame_for_test(colliding[1], 4);
+        mapped.record_frame_for_test(colliding[0], 6);
+        mapped.record_frame_for_test(colliding[2], 8);
+        mapped.record_frame_for_test(colliding[1], 10);
 
         assert_eq!(mapped.find_frame(colliding[0], 0, 10, None), Some(6));
         assert_eq!(mapped.find_frame(colliding[1], 0, 10, None), Some(10));
@@ -4131,11 +4364,11 @@ mod tests {
         let mapped = create_mapping(&path);
         let colliding = colliding_page_ids(3);
 
-        mapped.record_frame(colliding[0], 1);
-        mapped.record_frame(colliding[1], 2);
+        mapped.record_frame_for_test(colliding[0], 1);
+        mapped.record_frame_for_test(colliding[1], 2);
 
         mapped.rollback_frames(1);
-        mapped.record_frame(colliding[2], 2);
+        mapped.record_frame_for_test(colliding[2], 2);
 
         assert_eq!(mapped.find_frame(colliding[0], 0, 2, None), Some(1));
         assert_eq!(mapped.find_frame(colliding[1], 0, 2, None), None);
@@ -4167,11 +4400,11 @@ mod tests {
         let path = dir.path().join("coordination.tshm");
         let mapped = create_mapping(&path);
 
-        mapped.record_frame(7, 2);
-        mapped.record_frame(9, 4);
-        mapped.record_frame(11, 8);
-        mapped.record_frame(7, 13);
-        mapped.record_frame(9, 21);
+        mapped.record_frame_for_test(7, 2);
+        mapped.record_frame_for_test(9, 4);
+        mapped.record_frame_for_test(11, 8);
+        mapped.record_frame_for_test(7, 13);
+        mapped.record_frame_for_test(9, 21);
 
         assert_eq!(mapped.find_frame(7, 0, 21, None), Some(13));
         assert_eq!(mapped.find_frame(7, 0, 21, Some(12)), Some(2));
@@ -4191,12 +4424,12 @@ mod tests {
         let mapped = create_mapping(&path);
         let boundary = FRAME_INDEX_BLOCK_CAPACITY as u64;
 
-        mapped.record_frame(7, 2);
+        mapped.record_frame_for_test(7, 2);
         for frame_id in 3..=boundary + 1 {
-            mapped.record_frame(100 + (frame_id % 17), frame_id);
+            mapped.record_frame_for_test(100 + (frame_id % 17), frame_id);
         }
-        mapped.record_frame(7, boundary + 2);
-        mapped.record_frame(19, boundary + 3);
+        mapped.record_frame_for_test(7, boundary + 2);
+        mapped.record_frame_for_test(19, boundary + 3);
 
         assert_eq!(
             mapped.find_frame(7, 0, boundary + 3, None),
@@ -4207,8 +4440,8 @@ mod tests {
         assert_eq!(mapped.find_frame(7, 0, boundary + 3, None), Some(2));
         assert_eq!(mapped.find_frame(19, 0, boundary + 3, None), None);
 
-        mapped.record_frame(23, boundary + 2);
-        mapped.record_frame(7, boundary + 3);
+        mapped.record_frame_for_test(23, boundary + 2);
+        mapped.record_frame_for_test(7, boundary + 3);
         assert_eq!(
             mapped.find_frame(23, 0, boundary + 3, None),
             Some(boundary + 2)

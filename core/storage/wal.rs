@@ -1437,7 +1437,7 @@ impl ShmWalCoordination {
     fn new(
         shared: Arc<RwLock<WalFileShared>>,
         authority: Arc<MappedSharedWalCoordination>,
-    ) -> Self {
+    ) -> Result<Self> {
         let fallback = InProcessWalCoordination::new(shared.clone());
         let coordination = Self {
             shared,
@@ -1446,8 +1446,9 @@ impl ShmWalCoordination {
             authority,
             active_reader: Mutex::new(None),
         };
-        coordination.seed_or_sync_authority();
-        coordination
+        coordination.seed_or_sync_authority()?;
+        coordination.authority.finish_open()?;
+        Ok(coordination)
     }
 
     fn authority_is_uninitialized(snapshot: SharedWalCoordinationHeader) -> bool {
@@ -1526,6 +1527,10 @@ impl ShmWalCoordination {
     }
 
     fn sync_authority_frames_from_local(&self) {
+        turso_assert!(
+            self.authority.writer_lock_held_by_this_mapping(),
+            "rebuilding the shared WAL frame index requires writer ownership"
+        );
         let entries = {
             let shared = self.shared.read();
             let frame_cache = shared.runtime.frame_cache.lock();
@@ -1580,7 +1585,7 @@ impl ShmWalCoordination {
             // same visible WAL generation, compare the latest per-page
             // mappings directly and rebuild if they diverge.
             if self.authority.frame_index_overflowed()
-                || (self.authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive
+                || (self.authority.exclusive_startup_ownership_held()
                     && !self.authority_frame_index_matches_local_wal_scan(local_snapshot.max_frame))
             {
                 self.authority
@@ -1732,57 +1737,61 @@ impl ShmWalCoordination {
     /// 1. **Authority uninitialized** (fresh tshm): seed it from our local
     ///    WAL scan — we are the first process.
     ///
-    /// 2. **Authority initialized and we opened from a local disk scan**
-    ///    (no writer/checkpoint is active): repair transient owner/reader
-    ///    state first. If the scan only sees an empty WAL and the durable
-    ///    authority is already at frame 0, keep the durable authority because
-    ///    the scan cannot prove newer header metadata. Otherwise, if the
-    ///    local scan agrees with the WAL-provable subset of the durable
-    ///    snapshot, keep the durable authority. If not, discard the durable
-    ///    frame index and rebuild it from the local scan.
+    /// 2. **Authority initialized and we opened exclusively from a local disk
+    ///    scan**: acquire both shared recovery locks, repair transient
+    ///    owner/reader state, and reconcile the durable index from the scan.
     ///
-    /// 3. **Authority initialized and trustworthy**: adopt the authority's
-    ///    snapshot as our local state. If our local view also came from a
-    ///    disk scan and the authority's frame index is empty, backfill it
-    ///    from our local frame cache.
-    fn seed_or_sync_authority(&self) {
-        let snapshot = self.authority.snapshot();
+    /// 3. **Authority initialized or another process is present**: adopt the
+    ///    authority snapshot. Multiprocess opens never mutate the frame index
+    ///    from a check-then-act disk scan.
+    fn seed_or_sync_authority(&self) -> Result<()> {
         let local_wal_view_loaded_from_disk = self
             .shared
             .read()
             .metadata
             .loaded_from_disk_scan
             .load(Ordering::Acquire);
-        if Self::authority_is_uninitialized(snapshot) {
-            self.sync_authority_from_local();
-            self.sync_authority_frames_from_local();
-        } else if local_wal_view_loaded_from_disk
-            && !self.authority.writer_or_checkpoint_lock_active()
-        {
-            self.repair_or_reseed_authority_from_local_disk_scan(snapshot);
-        } else {
-            let needs_zero_frame_header_rewrite = snapshot.max_frame == 0 && {
-                let shared = self.shared.read();
-                !shared.metadata.initialized.load(Ordering::Acquire)
-                    || !Self::local_zero_frame_generation_matches_authority_snapshot(
-                        snapshot, &shared,
-                    )
-            };
-            self.sync_local_from_authority(snapshot);
-            if needs_zero_frame_header_rewrite {
-                self.shared
-                    .read()
-                    .metadata
-                    .initialized
-                    .store(false, Ordering::Release);
+        if self.authority.exclusive_startup_ownership_held() {
+            if !self.authority.try_acquire_checkpoint(self.owner) {
+                return Err(LimboError::LockingError(
+                    "failed acquiring checkpoint lock for exclusive shared WAL recovery".into(),
+                ));
             }
-            if local_wal_view_loaded_from_disk
-                && !self.authority.writer_or_checkpoint_lock_active()
-                && self.authority.iter_latest_frames(0, u64::MAX).is_empty()
-            {
+            if !self.authority.try_acquire_writer(self.owner) {
+                self.authority.release_checkpoint(self.owner);
+                return Err(LimboError::LockingError(
+                    "failed acquiring writer lock for exclusive shared WAL recovery".into(),
+                ));
+            }
+            let snapshot = self.authority.snapshot();
+            if Self::authority_is_uninitialized(snapshot) {
+                self.sync_authority_from_local();
                 self.sync_authority_frames_from_local();
+            } else if local_wal_view_loaded_from_disk {
+                self.repair_or_reseed_authority_from_local_disk_scan(snapshot);
+            } else {
+                self.sync_local_from_authority(snapshot);
             }
+            self.authority.release_writer(self.owner);
+            self.authority.release_checkpoint(self.owner);
+            return Ok(());
         }
+
+        let snapshot = self.authority.snapshot();
+        let needs_zero_frame_header_rewrite = snapshot.max_frame == 0 && {
+            let shared = self.shared.read();
+            !shared.metadata.initialized.load(Ordering::Acquire)
+                || !Self::local_zero_frame_generation_matches_authority_snapshot(snapshot, &shared)
+        };
+        self.sync_local_from_authority(snapshot);
+        if needs_zero_frame_header_rewrite {
+            self.shared
+                .read()
+                .metadata
+                .initialized
+                .store(false, Ordering::Release);
+        }
+        Ok(())
     }
 
     fn restart_snapshot_from_authority(
@@ -1862,6 +1871,12 @@ impl ShmWalCoordination {
             "refusing live overflow fallback refresh on a read path because it would require blocking WAL scan I/O"
         );
         Err(LimboError::Busy)
+    }
+
+    #[cfg(test)]
+    fn cache_frame_for_test(&self, page_id: u64, frame_id: u64) {
+        self.fallback.cache_frame(page_id, frame_id);
+        self.authority.record_frame_for_test(page_id, frame_id);
     }
 }
 
@@ -4597,16 +4612,16 @@ impl WalFile {
         authority: Arc<MappedSharedWalCoordination>,
         _last_checksum_and_max_frame: ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
-    ) -> Self {
+    ) -> Result<Self> {
         let coordination: Arc<dyn WalCoordination> =
-            Arc::new(ShmWalCoordination::new(shared, authority));
+            Arc::new(ShmWalCoordination::new(shared, authority)?);
         let snapshot = coordination.load_snapshot();
-        Self::new_with_coordination(
+        Ok(Self::new_with_coordination(
             io,
             coordination,
             (snapshot.last_checksum, snapshot.max_frame),
             buffer_pool,
-        )
+        ))
     }
 
     pub fn new(
@@ -6549,7 +6564,7 @@ pub mod test {
         let io = shared_wal_test_io();
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, path, 64).unwrap());
-        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         (authority, coordination)
     }
 
@@ -6902,9 +6917,9 @@ pub mod test {
 
         // Frames are cached in WAL append order (globally ascending): page 7 at
         // frame 2, page 9 at frame 4, page 7 again at frame 5.
-        coordination.cache_frame(7, 2);
-        coordination.cache_frame(9, 4);
-        coordination.cache_frame(7, 5);
+        coordination.cache_frame_for_test(7, 2);
+        coordination.cache_frame_for_test(9, 4);
+        coordination.cache_frame_for_test(7, 5);
 
         assert_eq!(coordination.find_frame(7, 0, 5, None), Some(5));
         assert_eq!(coordination.iter_latest_frames(0, 5), vec![(7, 5), (9, 4)]);
@@ -6933,16 +6948,16 @@ pub mod test {
         let coordination = make_test_coordination(&shared);
 
         // Ascending append: page 7 @3, page 9 @4, page 7 @5.
-        coordination.cache_frame(7, 3);
-        coordination.cache_frame(9, 4);
-        coordination.cache_frame(7, 5);
+        coordination.cache_frame_for_test(7, 3);
+        coordination.cache_frame_for_test(9, 4);
+        coordination.cache_frame_for_test(7, 5);
         assert_eq!(coordination.find_frame(9, 0, 10, None), Some(4));
 
         // The append position rewinds and frame slots 4 and 5 are overwritten,
         // now belonging to page 11 (@4) and page 13 (@5). The earlier owners of
         // those slots (page 9 @4, page 7 @5) must no longer be reachable.
-        coordination.cache_frame(11, 4);
-        coordination.cache_frame(13, 5);
+        coordination.cache_frame_for_test(11, 4);
+        coordination.cache_frame_for_test(13, 5);
 
         assert_eq!(
             coordination.find_frame(9, 0, 10, None),
@@ -6981,9 +6996,9 @@ pub mod test {
         // The connection spilled uncommitted frames past the committed
         // high-water mark (25); a savepoint opened mid-transaction recorded
         // frame 27.
-        coordination.cache_frame(7, 10);
-        coordination.cache_frame(9, 26);
-        coordination.cache_frame(11, 28);
+        coordination.cache_frame_for_test(7, 10);
+        coordination.cache_frame_for_test(9, 26);
+        coordination.cache_frame_for_test(11, 28);
         wal.max_frame.store(30, Ordering::Release);
 
         wal.rollback(Some(RollbackTo {
@@ -7084,9 +7099,9 @@ pub mod test {
 
         let (_authority_a, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
         let (authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
-        coordination_a.cache_frame(7, 2);
-        coordination_a.cache_frame(9, 4);
-        coordination_a.cache_frame(7, 5);
+        coordination_a.cache_frame_for_test(7, 2);
+        coordination_a.cache_frame_for_test(9, 4);
+        coordination_a.cache_frame_for_test(7, 5);
 
         assert_eq!(coordination_b.load_snapshot(), snapshot);
         assert_eq!(coordination_b.wal_header().page_size, 4096);
@@ -7213,8 +7228,8 @@ pub mod test {
 
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-        let writer = ShmWalCoordination::new(shared.clone(), authority.clone());
-        let sibling = ShmWalCoordination::new(shared, authority);
+        let writer = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
+        let sibling = ShmWalCoordination::new(shared, authority).unwrap();
         let writer_guard = writer.try_begin_read_tx(snapshot).unwrap();
         let sibling_guard = sibling.try_begin_read_tx(snapshot).unwrap();
         assert!(writer.try_begin_write_tx());
@@ -7263,7 +7278,7 @@ pub mod test {
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
         let mut readers = Vec::new();
         for _ in 0..128 {
-            let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+            let coordination = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
             let read_guard = coordination
                 .try_begin_read_tx(snapshot)
                 .expect("same-snapshot readers should share a published reader barrier");
@@ -7318,9 +7333,9 @@ pub mod test {
 
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-        let reader_a1 = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let reader_a1 = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         let guard_a1 = reader_a1.try_begin_read_tx(snapshot_a).unwrap();
-        let reader_a2 = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let reader_a2 = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         let guard_a2 = reader_a2.try_begin_read_tx(snapshot_a).unwrap();
         assert_eq!(
             authority.min_active_reader_frame(),
@@ -7341,9 +7356,9 @@ pub mod test {
             transaction_count: snapshot_b.transaction_count,
         });
 
-        let reader_b1 = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let reader_b1 = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         let guard_b1 = reader_b1.try_begin_read_tx(snapshot_b).unwrap();
-        let reader_b2 = ShmWalCoordination::new(shared, authority.clone());
+        let reader_b2 = ShmWalCoordination::new(shared, authority.clone()).unwrap();
         let guard_b2 = reader_b2.try_begin_read_tx(snapshot_b).unwrap();
 
         assert_eq!(
@@ -7413,11 +7428,11 @@ pub mod test {
         let (_authority_a, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
         let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
 
-        coordination_a.cache_frame(7, 2);
+        coordination_a.cache_frame_for_test(7, 2);
         for frame_id in 3..=OLD_FIXED_LIMIT + 1 {
-            coordination_a.cache_frame(100 + (frame_id % 31), frame_id);
+            coordination_a.cache_frame_for_test(100 + (frame_id % 31), frame_id);
         }
-        coordination_a.cache_frame(7, OLD_FIXED_LIMIT + 2);
+        coordination_a.cache_frame_for_test(7, OLD_FIXED_LIMIT + 2);
 
         assert_eq!(
             coordination_b.find_frame(7, 0, OLD_FIXED_LIMIT + 2, None),
@@ -7469,8 +7484,8 @@ pub mod test {
 
         let (_authority_a, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
         let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
-        coordination_a.cache_frame(7, 2);
-        coordination_a.cache_frame(9, 4);
+        coordination_a.cache_frame_for_test(7, 2);
+        coordination_a.cache_frame_for_test(9, 4);
 
         {
             let mut shared = shared_b.write();
@@ -7575,8 +7590,8 @@ pub mod test {
             }
 
             let (authority, coordination) = make_test_shm_coordination(&shared, &shm_path);
-            coordination.cache_frame(7, 2);
-            coordination.cache_frame(7, 5);
+            coordination.cache_frame_for_test(7, 2);
+            coordination.cache_frame_for_test(7, 5);
             assert_eq!(
                 authority.open_mode(),
                 SharedWalCoordinationOpenMode::Exclusive
@@ -7625,7 +7640,7 @@ pub mod test {
             let authority =
                 Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
             authority.install_snapshot(snapshot);
-            authority.record_frame(7, 1);
+            authority.record_frame_for_test(7, 1);
         }
         let reopened_authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
@@ -7677,7 +7692,8 @@ pub mod test {
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
         authority.install_snapshot(snapshot);
-        authority.record_frame(7, 1);
+        authority.record_frame_for_test(7, 1);
+        authority.finish_open().unwrap();
 
         let reopened_authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
@@ -7699,7 +7715,8 @@ pub mod test {
             reopened_authority.clone(),
             ((0, 0), 0),
             buffer_pool,
-        );
+        )
+        .unwrap();
 
         wal.begin_read_tx().unwrap();
         reopened_authority.mark_frame_index_overflowed_for_tests();
@@ -7735,7 +7752,7 @@ pub mod test {
                 nbackfills: snapshot.max_frame,
                 ..snapshot
             });
-            authority.record_frame(7, 1);
+            authority.record_frame_for_test(7, 1);
             assert_eq!(
                 authority.open_mode(),
                 SharedWalCoordinationOpenMode::Exclusive
@@ -7801,12 +7818,13 @@ pub mod test {
             reader_slot_count: 64,
         };
         authority.install_snapshot(snapshot);
-        authority.record_frame(7, 1);
+        authority.record_frame_for_test(7, 1);
 
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
         buffer_pool.finalize_with_page_size(4096).unwrap();
         let wal =
-            WalFile::new_with_shared_coordination(io, shared, authority, ((0, 0), 0), buffer_pool);
+            WalFile::new_with_shared_coordination(io, shared, authority, ((0, 0), 0), buffer_pool)
+                .unwrap();
 
         assert_eq!(wal.get_max_frame(), 1);
         assert_eq!(wal.get_last_checksum(), (31, 37));
@@ -7892,7 +7910,7 @@ pub mod test {
             "open_shared_from_authority_if_exists should not republish authority before coordination reconciliation"
         );
 
-        let exclusive_coordination = ShmWalCoordination::new(exclusive, authority.clone());
+        let exclusive_coordination = ShmWalCoordination::new(exclusive, authority.clone()).unwrap();
         assert_eq!(authority.iter_latest_frames(0, u64::MAX), vec![(7, 1)]);
         assert_eq!(exclusive_coordination.find_frame(7, 0, 1, None), Some(1));
 
@@ -7919,7 +7937,8 @@ pub mod test {
             .metadata
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
-        let reopened_coordination = ShmWalCoordination::new(reopened_shared, reopened_authority);
+        let reopened_coordination =
+            ShmWalCoordination::new(reopened_shared, reopened_authority).unwrap();
         assert_eq!(reopened_coordination.find_frame(7, 0, 1, None), Some(1));
     }
 
@@ -7964,7 +7983,7 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
 
-        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         let reopened = coordination.load_snapshot();
         assert_eq!(reopened.max_frame, 0);
         assert_eq!(reopened.nbackfills, 0);
@@ -8371,8 +8390,8 @@ pub mod test {
             header.checksum_2 = authoritative.last_checksum.1;
         }
         let (authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
-        coordination_a.cache_frame(7, 2);
-        coordination_a.cache_frame(7, 5);
+        coordination_a.cache_frame_for_test(7, 2);
+        coordination_a.cache_frame_for_test(7, 5);
         assert!(authority.try_acquire_writer(authority.owner_record()));
 
         let file_b = io
@@ -8448,8 +8467,8 @@ pub mod test {
             header.checksum_2 = authoritative.last_checksum.1;
         }
         let (authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
-        coordination_a.cache_frame(7, 2);
-        coordination_a.cache_frame(9, 5);
+        coordination_a.cache_frame_for_test(7, 2);
+        coordination_a.cache_frame_for_test(9, 5);
 
         let file_b = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
@@ -8527,8 +8546,8 @@ pub mod test {
         }
         {
             let (_authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
-            coordination_a.cache_frame(7, 2);
-            coordination_a.cache_frame(9, 4);
+            coordination_a.cache_frame_for_test(7, 2);
+            coordination_a.cache_frame_for_test(9, 4);
         }
 
         let file_b = io
@@ -8613,7 +8632,7 @@ pub mod test {
                 .store(true, Ordering::Release);
         }
 
-        let coordination = ShmWalCoordination::new(shared, authority.clone());
+        let coordination = ShmWalCoordination::new(shared, authority.clone()).unwrap();
         let snapshot = authority.snapshot();
         assert_eq!(snapshot, authoritative);
         let header = coordination.wal_header();
@@ -8657,8 +8676,8 @@ pub mod test {
             header.checksum_2 = authoritative.last_checksum.1;
         }
         let (authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
-        coordination_a.cache_frame(7, 2);
-        coordination_a.cache_frame(9, 5);
+        coordination_a.cache_frame_for_test(7, 2);
+        coordination_a.cache_frame_for_test(9, 5);
 
         let file_b = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
@@ -8744,7 +8763,7 @@ pub mod test {
             shared.runtime.epoch.store(1, Ordering::Release);
         }
 
-        let coordination = ShmWalCoordination::new(shared.clone(), authority);
+        let coordination = ShmWalCoordination::new(shared.clone(), authority).unwrap();
         assert!(
             !coordination.wal_is_initialized(),
             "a stale local initialized bit must not suppress the first header rewrite after RESTART/TRUNCATE"
@@ -8789,7 +8808,7 @@ pub mod test {
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
             .unwrap();
         let shared = WalFileShared::new_shared(file).unwrap();
-        let coordination = ShmWalCoordination::new(shared, authority.clone());
+        let coordination = ShmWalCoordination::new(shared, authority.clone()).unwrap();
 
         let prepared = coordination
             .prepare_wal_header(io.as_ref(), PageSize::new(4096).unwrap())
@@ -8868,7 +8887,7 @@ pub mod test {
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
             .unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
-        let coordination_b = ShmWalCoordination::new(shared_b.clone(), authority.clone());
+        let coordination_b = ShmWalCoordination::new(shared_b.clone(), authority.clone()).unwrap();
         // Simulate a long-lived process whose process-wide shared WAL metadata
         // fell behind the authority after another process checkpointed and
         // restarted the WAL back to frame 0.

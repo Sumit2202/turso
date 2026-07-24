@@ -1942,6 +1942,8 @@ impl Database {
                 } => {
                     // Always open shared WAL and set it in the Database and Pager.
                     // MVCC currently requires a WAL open to function.
+                    #[cfg(host_shared_wal)]
+                    let shared_authority = self.open_shared_wal_coordination_for_open()?;
                     let shared_wal = {
                         #[cfg(not(host_shared_wal))]
                         {
@@ -1961,7 +1963,6 @@ impl Database {
                             // fine. (Driver field is unused on host.)
                             let _ = &driver;
                             let flags = self.open_flags;
-                            let shared_authority = self.open_shared_wal_coordination_for_open()?;
                             if let Some(authority) = shared_authority.as_ref() {
                                 if !authority.frame_index_overflowed() {
                                     WalFileShared::open_shared_from_authority_if_exists(
@@ -1997,8 +1998,22 @@ impl Database {
                     self.shared_wal = shared_wal;
                     let last_checksum_and_max_frame =
                         self.shared_wal.read().last_checksum_and_max_frame();
+                    #[cfg(host_shared_wal)]
+                    let wal = self.build_wal_with_shared_coordination(
+                        last_checksum_and_max_frame,
+                        pager.buffer_pool.clone(),
+                        shared_authority.clone(),
+                    )?;
+                    #[cfg(not(host_shared_wal))]
                     let wal =
                         self.build_wal(last_checksum_and_max_frame, pager.buffer_pool.clone())?;
+
+                    // Only expose the authority to later connections after WAL
+                    // reconciliation and the startup lock downgrade succeed.
+                    #[cfg(host_shared_wal)]
+                    if let Some(authority) = shared_authority {
+                        let _ = self.shared_wal_coordination.set(authority);
+                    }
                     pager.set_wal(wal);
 
                     // Clear page cache after attaching WAL since pages may have been cached
@@ -2046,7 +2061,7 @@ impl Database {
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
         let flags = self.open_flags;
         #[cfg(host_shared_wal)]
-        let shared_authority = self.open_shared_wal_coordination_for_open()?;
+        let shared_authority = self.shared_wal_coordination()?;
         #[cfg(not(host_shared_wal))]
         let shared_authority: Option<()> = None;
 
@@ -2511,11 +2526,23 @@ impl Database {
     pub(crate) fn open_shared_wal_coordination_for_open(
         &self,
     ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
-        self.open_shared_wal_coordination_inner()
+        if let Some(authority) = self.shared_wal_coordination.get() {
+            return Ok(Some(authority.clone()));
+        }
+        self.open_shared_wal_coordination_uncached()
     }
 
     #[cfg(host_shared_wal)]
     fn open_shared_wal_coordination_inner(
+        &self,
+    ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
+        // New mappings must go through OpenWal's open -> reconcile -> finish ->
+        // publish transaction. Generic readers only observe completed state.
+        Ok(self.shared_wal_coordination.get().cloned())
+    }
+
+    #[cfg(host_shared_wal)]
+    fn open_shared_wal_coordination_uncached(
         &self,
     ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
         if !self.opts.enable_multiprocess_wal {
@@ -2539,10 +2566,6 @@ impl Database {
                 self.path
             )));
         }
-        if let Some(authority) = self.shared_wal_coordination.get() {
-            return Ok(Some(authority.clone()));
-        }
-
         let path = storage::wal::coordination_path_for_wal_path(&self.wal_path);
         let authority = if self.open_flags.contains(OpenFlags::ReadOnly) {
             let Some(authority) = MappedSharedWalCoordination::open_existing(
@@ -2566,13 +2589,7 @@ impl Database {
                 64,
             )?)
         };
-        let _ = self.shared_wal_coordination.set(authority.clone());
-        Ok(Some(
-            self.shared_wal_coordination
-                .get()
-                .cloned()
-                .unwrap_or(authority),
-        ))
+        Ok(Some(authority))
     }
 
     pub fn shared_wal_open_telemetry(&self) -> Result<SharedWalOpenTelemetry> {
@@ -2689,14 +2706,39 @@ impl Database {
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Arc<dyn Wal>> {
         #[cfg(host_shared_wal)]
-        if let Some(authority) = self.shared_wal_coordination()? {
+        {
+            let authority = self.shared_wal_coordination()?;
+            return self.build_wal_with_shared_coordination(
+                last_checksum_and_max_frame,
+                buffer_pool,
+                authority,
+            );
+        }
+
+        #[cfg(not(host_shared_wal))]
+        Ok(Arc::new(WalFile::new(
+            self.io.clone(),
+            self.shared_wal.clone(),
+            last_checksum_and_max_frame,
+            buffer_pool,
+        )))
+    }
+
+    #[cfg(host_shared_wal)]
+    fn build_wal_with_shared_coordination(
+        &self,
+        last_checksum_and_max_frame: ((u32, u32), u64),
+        buffer_pool: Arc<BufferPool>,
+        authority: Option<Arc<MappedSharedWalCoordination>>,
+    ) -> Result<Arc<dyn Wal>> {
+        if let Some(authority) = authority {
             return Ok(Arc::new(WalFile::new_with_shared_coordination(
                 self.io.clone(),
                 self.shared_wal.clone(),
                 authority,
                 last_checksum_and_max_frame,
                 buffer_pool,
-            )));
+            )?));
         }
 
         Ok(Arc::new(WalFile::new(

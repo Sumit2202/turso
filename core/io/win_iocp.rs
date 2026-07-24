@@ -276,7 +276,10 @@ crate::assert::assert_send_sync!(WindowsIOCP);
 
 impl IO for WindowsIOCP {
     fn supports_shared_wal_coordination(&self) -> bool {
-        true
+        // LockFileEx has no atomic exclusive-to-shared downgrade. Advertising
+        // support would let protocol migration seed a map and then fail while
+        // handing the lifetime lock to other processes.
+        false
     }
 
     #[instrument(skip_all, level = Level::TRACE)]
