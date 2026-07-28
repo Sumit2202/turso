@@ -41,7 +41,7 @@ mimalloc = { workspace = true, optional = true }
 
 hyper = { version = "1.8.1", features = ["http1"], optional = true }
 tokio = { workspace = true, features = ["full"], optional = true }
-hyper-rustls = { features = [ "rustls-native-certs", "http1" ], optional = true, version = "0.27.9" }
+hyper-rustls = { features = [ "rustls-native-certs", "http1", "ring", "native-tokio", "tls12", "logging" ], default-features = false, optional = true, version = "0.27.9" }
 hyper-util = { version = "0.1.19", features = [
     "http1",
     "tokio",
